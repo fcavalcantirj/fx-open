@@ -52,6 +52,55 @@ pub fn convertGatewayToolsJson(alloc: Allocator, gateway_tools_json: []const u8)
     return try out.toOwnedSlice();
 }
 
+/// Converts a Gateway function-tool JSON envelope into flat Responses API tools.
+pub fn convertGatewayToolsToResponsesJson(alloc: Allocator, gateway_tools_json: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, gateway_tools_json, " \n\r\t");
+    if (trimmed.len == 0) return alloc.dupe(u8, "[]");
+    if (trimmed[0] != '[') return error.InvalidToolArguments;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidToolArguments;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeByte('[');
+    var first = true;
+    for (parsed.value.array.items) |tool| {
+        if (tool != .object) continue;
+        const tool_type = tool.object.get("type") orelse continue;
+        if (tool_type != .string) continue;
+        if (std.mem.eql(u8, tool_type.string, "provider")) continue;
+        if (!std.mem.eql(u8, tool_type.string, "function")) continue;
+
+        const name = tool.object.get("name") orelse continue;
+        if (name != .string) continue;
+        const description = tool.object.get("description");
+        const input_schema = tool.object.get("inputSchema") orelse continue;
+
+        if (!first) try out.writer.writeByte(',');
+        first = false;
+
+        try out.writer.writeAll("{\"type\":\"function\",\"name\":");
+        try std.json.Stringify.value(name.string, .{}, &out.writer);
+        try out.writer.writeAll(",\"description\":");
+        if (description) |desc| {
+            if (desc == .string) {
+                try std.json.Stringify.value(desc.string, .{}, &out.writer);
+            } else {
+                try out.writer.writeAll("\"\"");
+            }
+        } else {
+            try out.writer.writeAll("\"\"");
+        }
+        try out.writer.writeAll(",\"parameters\":");
+        try std.json.Stringify.value(input_schema, .{}, &out.writer);
+        try out.writer.writeByte('}');
+    }
+    try out.writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
 test "convertGatewayToolsJson maps function envelope to OpenAI tools" {
     const alloc = std.testing.allocator;
     const gateway =

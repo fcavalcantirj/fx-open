@@ -318,7 +318,25 @@ fn consumeOpenAiSseStream(
         alloc.free(buffer);
     }
 
+    normalizeOpenAiToolFinishReason(&completion);
+
     return .{ .status = .ok, .completion = completion };
+}
+
+/// Many OpenAI-compatible servers (LiteLLM, Ollama, older proxies) stream function
+/// tool calls but finish with `stop` instead of OpenAI's `tool_calls`. Treat that
+/// as a tool-call completion so local tools can run.
+fn normalizeOpenAiToolFinishReason(completion: *types.GatewayCompletion) void {
+    if (completion.tool_calls.len == 0) return;
+    if (types.allToolCallsProviderExecuted(completion.tool_calls)) return;
+    const reason = completion.finish_reason orelse {
+        completion.finish_reason = .tool_calls;
+        return;
+    };
+    switch (reason) {
+        .stop, .other => completion.finish_reason = .tool_calls,
+        else => {},
+    }
 }
 
 fn handleOpenAiChunk(
@@ -455,6 +473,57 @@ test "handleOpenAiChunk accumulates streamed tool call fragments" {
     try std.testing.expectEqualStrings("call_1", tools.items[0].id.items);
     try std.testing.expectEqualStrings("read_file", tools.items[0].name.items);
     try std.testing.expectEqualStrings("{\"path\":\"/tmp\"}", tools.items[0].arguments.items);
+}
+
+test "normalizeOpenAiToolFinishReason upgrades stop finish to tool_calls" {
+    const call = types.ToolCall{
+        .id = "call_1",
+        .name = "read_file",
+        .arguments_json = "{}",
+    };
+    var completion = types.GatewayCompletion{
+        .finish_reason = .stop,
+        .tool_calls = &.{call},
+    };
+    normalizeOpenAiToolFinishReason(&completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+    try std.testing.expectEqual(
+        types.ProviderCompletionDisposition.completed,
+        types.classifyProviderCompletion(completion),
+    );
+}
+
+test "normalizeOpenAiToolFinishReason preserves provider-executed stop completions" {
+    const call = types.ToolCall{
+        .id = "search",
+        .name = "perplexity_search",
+        .arguments_json = "{}",
+        .provenance = .provider_executed,
+    };
+    var completion = types.GatewayCompletion{
+        .finish_reason = .stop,
+        .tool_calls = &.{call},
+    };
+    normalizeOpenAiToolFinishReason(&completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
+}
+
+test "normalizeOpenAiToolFinishReason upgrades stop when mixed with local tools" {
+    const calls = [_]types.ToolCall{
+        .{
+            .id = "search",
+            .name = "perplexity_search",
+            .arguments_json = "{}",
+            .provenance = .provider_executed,
+        },
+        .{ .id = "call_1", .name = "read_file", .arguments_json = "{}" },
+    };
+    var completion = types.GatewayCompletion{
+        .finish_reason = .stop,
+        .tool_calls = calls[0..],
+    };
+    normalizeOpenAiToolFinishReason(&completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
 }
 
 var announced_slot: usize = 0;

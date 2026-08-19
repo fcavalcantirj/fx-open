@@ -383,6 +383,7 @@ fn loadStartupStateFromOwnedWorkspace(
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
     openai_transport.configureProfileBaseUrl(settings.openai_base_url);
+    openai_transport.configureProfileApiStyle(settings.openai_api_style);
 
     state.workspace_access = try workspace_access.WorkspaceAccess.init(
         alloc,

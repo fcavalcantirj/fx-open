@@ -15,8 +15,10 @@ const gateway_client = @import("../gateway/client.zig");
 const gateway_failure_diagnostics = @import("../core/gateway/gateway_failure_diagnostics.zig");
 const gateway_json = @import("../core/gateway/gateway_json.zig");
 const openai_json = @import("../core/gateway/openai_json.zig");
+const openai_responses_json = @import("../core/gateway/openai_responses_json.zig");
 const openai_transport = @import("../core/gateway/openai_transport.zig");
 const openai_client = @import("../gateway/openai_client.zig");
+const openai_responses_client = @import("../gateway/openai_responses_client.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
@@ -148,6 +150,9 @@ pub fn buildAgentRequest(
     alloc: Allocator,
     request: agent_stream_provider_contract.BuildRequest,
 ) anyerror![]u8 {
+    if (openai_transport.isOpenAiResponsesUrl(request.chat_url)) {
+        return buildOpenAiResponsesAgentRequest(alloc, request);
+    }
     if (openai_transport.isOpenAiChatUrl(request.chat_url)) {
         return buildOpenAiAgentRequest(alloc, request);
     }
@@ -427,6 +432,33 @@ test "required vision request contains only the registered vision schema" {
     try std.testing.expect(std.mem.find(u8, body, "\"maxOutputTokens\":128000") != null);
 }
 
+fn buildOpenAiResponsesAgentRequest(
+    alloc: Allocator,
+    request: agent_stream_provider_contract.BuildRequest,
+) anyerror![]u8 {
+    if (request.verified_images != null or request.response_format != null) {
+        return error.VisionUnavailable;
+    }
+    if (request.vision_mode == .required) return error.VisionUnavailable;
+
+    const budget: ?gateway_json.BuildBudget = if (request.budget) |value|
+        .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
+    else
+        null;
+    if (budget) |active| try active.check();
+
+    return openai_responses_json.buildResponsesBody(
+        alloc,
+        request.model,
+        request.serialized_tools,
+        request.messages,
+        request.tool_choice,
+        request.max_output_tokens,
+        request.provider_options.reasoning,
+        budget,
+    );
+}
+
 fn buildOpenAiAgentRequest(
     alloc: Allocator,
     request: agent_stream_provider_contract.BuildRequest,
@@ -458,6 +490,9 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
+    if (openai_transport.isOpenAiResponsesUrl(request.chat_url)) {
+        return streamOpenAiResponsesAgentCompletion(alloc, request);
+    }
     if (openai_transport.isOpenAiChatUrl(request.chat_url)) {
         return streamOpenAiAgentCompletion(alloc, request);
     }
@@ -505,6 +540,48 @@ fn streamAgentCompletion(
         .failure_schema = diagnostics.schema,
         .failure_request_shape = diagnostics.request_shape,
         .retry_after_seconds = result.retry_after_seconds,
+        .ownership = .owned,
+    };
+}
+
+fn streamOpenAiResponsesAgentCompletion(
+    alloc: Allocator,
+    request: agent_stream_provider_contract.Request,
+) anyerror!agent_stream_provider_contract.Result {
+    const result = openai_responses_client.streamOpenAiResponsesCompletion(
+        alloc,
+        .{
+            .api_key = request.api_key,
+            .model = request.model,
+            .retry_count = request.retry_count,
+            .responses_url = request.chat_url,
+            .payload = request.payload,
+            .trace_ctx = request.trace_ctx,
+            .content_capture_limit = request.content_capture_limit,
+            .delivery = request.delivery,
+            .on_tool_input_chunk = request.on_tool_input_chunk,
+            .provider_attempt_owner = switch (request.provider_attempt_owner) {
+                .transport => .transport,
+                .agent => .agent,
+            },
+        },
+        request.callback_ctx,
+        request.on_content_chunk,
+        request.on_tool_start,
+        request.cancel_flag,
+    ) catch |err| {
+        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
+            err,
+            request.delivery.load(),
+        );
+        return err;
+    };
+    return .{
+        .status = result.status,
+        .completion = result.completion,
+        .err_body = result.err_body,
+        .retry_after_seconds = result.retry_after_seconds,
+        .reconcile_generation_usage = false,
         .ownership = .owned,
     };
 }
@@ -814,35 +891,46 @@ fn executeWebSearchProvider(
 
 pub fn chatUrl(fallback: []const u8) []const u8 {
     if (openai_transport.isActiveOpenAiMode()) {
-        return defaultOpenAiChatUrl();
+        return defaultOpenAiWireUrl();
     }
     return resolveChatUrl(fallback, io_mod.getenv(chat_url_env));
 }
 
-var openai_chat_url_buf: [512]u8 = undefined;
-var openai_chat_url_len: usize = 0;
+var openai_wire_url_buf: [512]u8 = undefined;
+var openai_wire_url_len: usize = 0;
 
-pub fn defaultOpenAiChatUrl() []const u8 {
+pub fn defaultOpenAiWireUrl() []const u8 {
     const base = openai_transport.resolveBaseUrl();
-    const formatted = openai_transport.formatChatUrl(&openai_chat_url_buf, base) catch {
+    const formatted = switch (openai_transport.resolveApiStyle()) {
+        .chat => openai_transport.formatChatUrl(&openai_wire_url_buf, base),
+        .responses => openai_transport.formatResponsesUrl(&openai_wire_url_buf, base),
+    } catch {
+        const suffix = switch (openai_transport.resolveApiStyle()) {
+            .chat => openai_transport.chat_completions_suffix,
+            .responses => openai_transport.responses_suffix,
+        };
         @memcpy(
-            openai_chat_url_buf[0..openai_transport.default_base_url.len],
+            openai_wire_url_buf[0..openai_transport.default_base_url.len],
             openai_transport.default_base_url,
         );
         @memcpy(
-            openai_chat_url_buf[openai_transport.default_base_url.len..][0..openai_transport.chat_completions_suffix.len],
-            openai_transport.chat_completions_suffix,
+            openai_wire_url_buf[openai_transport.default_base_url.len..][0..suffix.len],
+            suffix,
         );
-        openai_chat_url_len = openai_transport.default_base_url.len + openai_transport.chat_completions_suffix.len;
-        return openai_chat_url_buf[0..openai_chat_url_len];
+        openai_wire_url_len = openai_transport.default_base_url.len + suffix.len;
+        return openai_wire_url_buf[0..openai_wire_url_len];
     };
-    openai_chat_url_len = formatted.len;
-    return openai_chat_url_buf[0..openai_chat_url_len];
+    openai_wire_url_len = formatted.len;
+    return openai_wire_url_buf[0..openai_wire_url_len];
+}
+
+pub fn defaultOpenAiChatUrl() []const u8 {
+    return defaultOpenAiWireUrl();
 }
 
 pub fn defaultChatUrl() []const u8 {
     if (openai_transport.isActiveOpenAiMode()) {
-        return defaultOpenAiChatUrl();
+        return defaultOpenAiWireUrl();
     }
     return chatUrl(default_chat_url);
 }

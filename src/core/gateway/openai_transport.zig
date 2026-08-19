@@ -4,12 +4,33 @@ const types = @import("../shared/types.zig");
 
 pub const openai_api_key_env = "OPENAI_API_KEY";
 pub const openai_base_url_env = "FX_OPENAI_BASE_URL";
+pub const openai_api_style_env = "FX_OPENAI_API_STYLE";
 pub const default_base_url = "https://api.openai.com/v1";
 pub const models_path = "/v1/models";
 pub const chat_completions_suffix = "/chat/completions";
+pub const responses_suffix = "/responses";
 
 pub const e2e_openai_chat_url_env = "FX_E2E_OPENAI_CHAT_URL";
+pub const e2e_openai_responses_url_env = "FX_E2E_OPENAI_RESPONSES_URL";
 pub const e2e_openai_models_url_env = "FX_E2E_OPENAI_MODELS_URL";
+
+pub const ApiStyle = enum {
+    chat,
+    responses,
+
+    pub fn parse(raw: []const u8) ?ApiStyle {
+        if (std.ascii.eqlIgnoreCase(raw, "chat")) return .chat;
+        if (std.ascii.eqlIgnoreCase(raw, "responses")) return .responses;
+        return null;
+    }
+
+    pub fn label(self: ApiStyle) []const u8 {
+        return switch (self) {
+            .chat => "chat",
+            .responses => "responses",
+        };
+    }
+};
 
 pub fn isOpenAiCredentialSource(source: types.CredentialSource) bool {
     return source == .openai_api_key;
@@ -30,6 +51,8 @@ pub fn resolveBaseUrl() []const u8 {
 
 var profile_base_url_storage: [512]u8 = undefined;
 var profile_base_url_len: usize = 0;
+var profile_api_style: ApiStyle = .chat;
+var profile_api_style_configured: bool = false;
 var active_openai_mode: bool = false;
 
 pub fn setActiveOpenAiMode(active: bool) void {
@@ -50,6 +73,27 @@ pub fn configureProfileBaseUrl(url: ?[]const u8) void {
     }
 }
 
+pub fn configureProfileApiStyle(style: ?[]const u8) void {
+    profile_api_style = .chat;
+    profile_api_style_configured = false;
+    if (style) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len == 0) return;
+        if (ApiStyle.parse(trimmed)) |parsed| {
+            profile_api_style = parsed;
+            profile_api_style_configured = true;
+        }
+    }
+}
+
+pub fn resolveApiStyle() ApiStyle {
+    if (nonEmptyEnv(openai_api_style_env)) |value| {
+        if (ApiStyle.parse(value)) |parsed| return parsed;
+    }
+    if (profile_api_style_configured) return profile_api_style;
+    return .chat;
+}
+
 fn profileBaseUrl() ?[]const u8 {
     if (profile_base_url_len == 0) return null;
     return profile_base_url_storage[0..profile_base_url_len];
@@ -57,6 +101,14 @@ fn profileBaseUrl() ?[]const u8 {
 
 pub fn isOpenAiChatUrl(chat_url: []const u8) bool {
     return std.mem.endsWith(u8, chat_url, chat_completions_suffix);
+}
+
+pub fn isOpenAiResponsesUrl(chat_url: []const u8) bool {
+    return std.mem.endsWith(u8, chat_url, responses_suffix);
+}
+
+pub fn isOpenAiWireUrl(chat_url: []const u8) bool {
+    return isOpenAiChatUrl(chat_url) or isOpenAiResponsesUrl(chat_url);
 }
 
 /// Writes `{base}/chat/completions` into `buf` and returns the used slice.
@@ -68,6 +120,30 @@ pub fn formatChatUrl(buf: []u8, base_url: []const u8) ![]const u8 {
         return buf[0..trimmed.len];
     }
     const path_suffix = if (trimmed.len == 0) chat_completions_suffix else "chat/completions";
+    const total = if (trimmed.len == 0)
+        path_suffix.len
+    else
+        trimmed.len + 1 + path_suffix.len;
+    if (total > buf.len) return error.PathTooLong;
+    if (trimmed.len == 0) {
+        @memcpy(buf[0..path_suffix.len], path_suffix);
+        return buf[0..path_suffix.len];
+    }
+    @memcpy(buf[0..trimmed.len], trimmed);
+    buf[trimmed.len] = '/';
+    @memcpy(buf[trimmed.len + 1 .. trimmed.len + 1 + path_suffix.len], path_suffix);
+    return buf[0 .. trimmed.len + 1 + path_suffix.len];
+}
+
+/// Writes `{base}/responses` into `buf` and returns the used slice.
+pub fn formatResponsesUrl(buf: []u8, base_url: []const u8) ![]const u8 {
+    const trimmed = std.mem.trimEnd(u8, base_url, "/");
+    if (std.mem.endsWith(u8, trimmed, responses_suffix)) {
+        if (trimmed.len > buf.len) return error.PathTooLong;
+        @memcpy(buf[0..trimmed.len], trimmed);
+        return buf[0..trimmed.len];
+    }
+    const path_suffix = if (trimmed.len == 0) responses_suffix else "responses";
     const total = if (trimmed.len == 0)
         path_suffix.len
     else
@@ -101,6 +177,27 @@ test "isActiveOpenAiMode follows selected credential flag only" {
     setActiveOpenAiMode(true);
     defer setActiveOpenAiMode(false);
     try std.testing.expect(isActiveOpenAiMode());
+}
+
+test "resolveApiStyle uses profile when env unset" {
+    configureProfileApiStyle("responses");
+    defer configureProfileApiStyle(null);
+    try std.testing.expectEqual(ApiStyle.responses, resolveApiStyle());
+}
+
+test "ApiStyle parse accepts chat and responses" {
+    try std.testing.expectEqual(ApiStyle.chat, ApiStyle.parse("chat").?);
+    try std.testing.expectEqual(ApiStyle.responses, ApiStyle.parse("RESPONSES").?);
+    try std.testing.expect(ApiStyle.parse("invalid") == null);
+}
+
+test "formatResponsesUrl composes base and suffix" {
+    var buf: [128]u8 = undefined;
+    const official = try formatResponsesUrl(&buf, "https://api.openai.com/v1");
+    try std.testing.expectEqualStrings("https://api.openai.com/v1/responses", official);
+
+    const ollama = try formatResponsesUrl(&buf, "http://127.0.0.1:11434/v1/");
+    try std.testing.expectEqualStrings("http://127.0.0.1:11434/v1/responses", ollama);
 }
 
 test "formatChatUrl composes base and suffix" {
