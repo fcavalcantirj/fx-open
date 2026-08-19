@@ -103,6 +103,8 @@ pub const BuildRequest = struct {
     budget: ?BuildBudget = null,
     verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
     response_format: ?StructuredResponseFormat = null,
+    /// When set, selects OpenAI Chat Completions encoding for `/chat/completions` URLs.
+    chat_url: []const u8 = "",
 };
 
 pub const Request = struct {

@@ -33,6 +33,7 @@ pub const CatalogPublicOnlyReason = std.meta.Tag(CatalogPublicOnly);
 pub const CatalogAuthenticatedSource = enum {
     vercel_oidc_token,
     ai_gateway_api_key,
+    openai_api_key,
     fx_login,
     stored_key,
 
@@ -40,6 +41,7 @@ pub const CatalogAuthenticatedSource = enum {
         return switch (self) {
             .vercel_oidc_token => .vercel_oidc_token,
             .ai_gateway_api_key => .ai_gateway_api_key,
+            .openai_api_key => .openai_api_key,
             .fx_login => .fx_login,
             .stored_key => .stored_key,
         };
@@ -132,6 +134,7 @@ pub fn catalogAccessForCredential(
     const authenticated_source: CatalogAuthenticatedSource = switch (selected_source) {
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
+        .openai_api_key => .openai_api_key,
         .stored_key => .stored_key,
         .fx_login => blk: {
             const team = team_context orelse
@@ -160,8 +163,8 @@ pub const LoadMode = enum { stored, refresh_if_needed };
 
 const FxLoginRefreshMode = enum { if_needed, force };
 
-pub const missing_credential_message = "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
-pub const missing_interactive_credential_message = "Fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_credential_message = "Fx needs model access. Run fx login to sign in, fx setup to use a Gateway API key, set AI_GATEWAY_API_KEY, or set OPENAI_API_KEY for an OpenAI-compatible server.";
+pub const missing_interactive_credential_message = "Fx needs model access. Run /login to sign in, /setup to use a Gateway API key, set AI_GATEWAY_API_KEY, or set OPENAI_API_KEY for an OpenAI-compatible server.";
 pub const unreadable_store_message = "Fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
 pub const Credential = struct {
@@ -237,6 +240,8 @@ pub fn resolvePreferring(
     if (try loadSource(alloc, transport, secret_store, .vercel_oidc_token)) |credential| return .{ .credential = credential };
     if (try loadSource(alloc, transport, secret_store, .ai_gateway_api_key)) |credential| return .{ .credential = credential };
 
+    if (try loadSource(alloc, transport, secret_store, .openai_api_key)) |credential| return .{ .credential = credential };
+
     const fx_login = switch (mode) {
         .stored => try loadStoredFxLoginCredential(alloc),
         .refresh_if_needed => try loadFxLoginCredential(alloc, transport),
@@ -282,6 +287,7 @@ pub fn loadSource(
     return switch (source) {
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
+        .openai_api_key => loadOpenAiApiKeyCredential(alloc, source),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
     };
@@ -295,6 +301,7 @@ pub fn sourceExists(
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
+        .openai_api_key => openAiApiKeyEnvPresent(),
         .fx_login => blk: {
             const loaded = oauth_session.load(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -321,6 +328,15 @@ pub fn sourceExists(
             break :blk true;
         },
     };
+}
+
+fn openAiApiKeyEnvPresent() bool {
+    return nonEmptyEnvValue("OPENAI_API_KEY") != null or nonEmptyEnvValue("LITELLM_API_KEY") != null;
+}
+
+fn loadOpenAiApiKeyCredential(alloc: std.mem.Allocator, source: Source) !?Credential {
+    if (try loadEnvCredential(alloc, "OPENAI_API_KEY", source)) |credential| return credential;
+    return try loadEnvCredential(alloc, "LITELLM_API_KEY", source);
 }
 
 fn loadEnvCredential(
@@ -469,6 +485,7 @@ pub fn sourceLabel(source: Source) []const u8 {
     return switch (source) {
         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
+        .openai_api_key => "OPENAI_API_KEY",
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
     };
@@ -491,15 +508,19 @@ test "missing credential messages use surface commands in preferred order" {
     const cli_setup = std.mem.find(u8, missing_credential_message, "fx setup").?;
     const cli_env = std.mem.find(u8, missing_credential_message, "AI_GATEWAY_API_KEY").?;
 
+    const cli_openai = std.mem.find(u8, missing_credential_message, "OPENAI_API_KEY").?;
     try std.testing.expect(cli_login < cli_setup);
     try std.testing.expect(cli_setup < cli_env);
+    try std.testing.expect(cli_env < cli_openai);
 
     const tui_login = std.mem.find(u8, missing_interactive_credential_message, "/login").?;
     const tui_setup = std.mem.find(u8, missing_interactive_credential_message, "/setup").?;
     const tui_env = std.mem.find(u8, missing_interactive_credential_message, "AI_GATEWAY_API_KEY").?;
+    const tui_openai = std.mem.find(u8, missing_interactive_credential_message, "OPENAI_API_KEY").?;
 
     try std.testing.expect(tui_login < tui_setup);
     try std.testing.expect(tui_setup < tui_env);
+    try std.testing.expect(tui_env < tui_openai);
 }
 
 test "credential gateway team prefers team id" {
@@ -714,6 +735,31 @@ test "source-specific credential loading bypasses generic precedence" {
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .ai_gateway_api_key));
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .vercel_oidc_token));
     try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .stored_key)));
+}
+
+test "openai credential loads OPENAI_API_KEY before LITELLM_API_KEY" {
+    const alloc = std.testing.allocator;
+
+    const openai_first = try CredentialTestEnv.install(alloc, &.{
+        .{ "OPENAI_API_KEY", "openai-key" },
+        .{ "LITELLM_API_KEY", "litellm-key" },
+    });
+    defer openai_first.deinit();
+
+    var preferred = (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .openai_api_key)).?;
+    defer preferred.deinit(alloc);
+    try std.testing.expectEqualStrings("openai-key", preferred.token);
+    try std.testing.expectEqual(Source.openai_api_key, preferred.source);
+
+    const litellm_only = try CredentialTestEnv.install(alloc, &.{
+        .{ "LITELLM_API_KEY", "litellm-key" },
+    });
+    defer litellm_only.deinit();
+
+    var litellm = (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .openai_api_key)).?;
+    defer litellm.deinit(alloc);
+    try std.testing.expectEqualStrings("litellm-key", litellm.token);
+    try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .openai_api_key));
 }
 
 test "a remembered choice outranks the environment" {

@@ -4,6 +4,7 @@ const credentials = @import("credentials.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("login_flow.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -21,6 +22,7 @@ pub const CredentialRefreshMode = enum {
 const credential_source_order = [_]credentials.Source{
     .vercel_oidc_token,
     .ai_gateway_api_key,
+    .openai_api_key,
     .fx_login,
     .stored_key,
 };
@@ -1085,6 +1087,7 @@ pub const Runtime = struct {
         credential.team_slug = null;
         self.source_inventory.insert(source);
         if (source == .stored_key) self.stored_key_status = .not_attempted;
+        openai_transport.setActiveOpenAiMode(openai_transport.isOpenAiCredentialSource(source));
         return changed;
     }
 
@@ -1150,6 +1153,7 @@ pub const Runtime = struct {
         if (self.selected_credential) |*credential| credential.deinit(alloc);
         self.selected_credential = null;
         self.credential_refresh_failure_source = null;
+        openai_transport.setActiveOpenAiMode(false);
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
         for (credential_source_order) |source| {
@@ -1184,6 +1188,7 @@ pub const Runtime = struct {
             if (self.selected_credential) |*credential| credential.deinit(alloc);
             self.selected_credential = null;
             self.credential_refresh_failure_source = null;
+            openai_transport.setActiveOpenAiMode(false);
         }
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
@@ -2030,6 +2035,27 @@ test "clearing a remembered choice re-resolves even when no login was active" {
     );
     try std.testing.expect(changed);
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, runtime.credentialSource().?);
+}
+
+test "switch credential stage includes OpenAI in inventory without panic" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .openai_api_key, .fx_login });
+    var active = try makeTestCredential(alloc, "gateway-token", .ai_gateway_api_key, null, null);
+    defer active.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &active);
+    runtime.openPicker(alloc);
+    runtime.openSwitchCredentialPicker(alloc);
+
+    const switch_view = runtime.pickerView();
+    try std.testing.expectEqual(@as(usize, 4), switch_view.choiceCount());
+    try std.testing.expect((Choice{ .source = .openai_api_key }).eql(switch_view.choiceAt(1).?));
+    try std.testing.expectEqualStrings(
+        credentials.sourceLabel(.openai_api_key),
+        switch_view.choiceLabel(switch_view.choiceAt(1).?),
+    );
 }
 
 test "switch credential stage includes the active source and pops to its root action" {

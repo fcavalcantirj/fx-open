@@ -7,6 +7,7 @@ const app_runtime_setup = @import("app_runtime_setup.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const host = @import("../hosts/host.zig");
 const debug_trace = @import("../shared/debug_trace.zig");

@@ -6,6 +6,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -381,6 +382,7 @@ fn loadStartupStateFromOwnedWorkspace(
         try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
+    openai_transport.configureProfileBaseUrl(settings.openai_base_url);
 
     state.workspace_access = try workspace_access.WorkspaceAccess.init(
         alloc,
@@ -400,7 +402,22 @@ fn loadStartupStateFromOwnedWorkspace(
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     if (credential_mode) |mode| {
         const resolution = try credentials.resolvePreferring(alloc, transport, secret_store, mode, settings.credential_source);
-        state.credential = resolution.credential;
+        if (resolution.credential) |credential| {
+            state.credential = credential;
+        } else if (settings.openai_api_key) |profile_key| {
+            const trimmed = std.mem.trim(u8, profile_key, " \t\r\n");
+            if (trimmed.len > 0) {
+                state.credential = .{
+                    .token = try alloc.dupe(u8, trimmed),
+                    .source = .openai_api_key,
+                };
+            }
+        }
+        if (state.credential) |credential| {
+            openai_transport.setActiveOpenAiMode(
+                openai_transport.isOpenAiCredentialSource(credential.source),
+            );
+        }
         state.stored_key_status = resolution.stored_key_status;
     }
     state.permission_mode = loadPermissionMode(settings.permission_mode);
@@ -429,6 +446,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
+    state.credential_onboarding_skipped = credentialOnboardingDisabled(settings);
 
     return state;
 }
@@ -449,8 +467,6 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.default_agent_step_limit,
     );
     errdefer state.deinit(cfg.alloc);
-
-    state.credential_onboarding_skipped = credentialOnboardingDisabled();
 
     errdefer shutdownInteractiveShell(
         cfg.terminal,
@@ -1131,7 +1147,18 @@ fn loadStartupStatusModel(alloc: Allocator, default_model: []const u8, configure
     return .{ .value = owned, .owned = owned };
 }
 
-fn credentialOnboardingDisabled() bool {
+fn credentialOnboardingDisabled(settings: *const config_runtime.Settings) bool {
+    if (credentialOnboardingDisabledFromEnv()) return true;
+    if (settings.openai_api_key) |key| {
+        if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
+    }
+    return false;
+}
+
+fn credentialOnboardingDisabledFromEnv() bool {
+    if (io_mod.getenv("OPENAI_API_KEY")) |raw| {
+        if (std.mem.trim(u8, raw, " \t\r\n").len > 0) return true;
+    }
     const value = io_mod.getenv("FX_SKIP_ONBOARDING") orelse return false;
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len == 0) return false;
@@ -2232,7 +2259,7 @@ test "credential onboarding can be skipped independently from Keychain" {
     });
     defer env.deinit();
 
-    const onboarding_skipped = credentialOnboardingDisabled();
+    const onboarding_skipped = credentialOnboardingDisabledFromEnv();
     try std.testing.expect(onboarding_skipped);
 }
 

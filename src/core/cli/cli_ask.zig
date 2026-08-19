@@ -1344,9 +1344,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         return missingCredentialResult(alloc, options);
     }
 
+    var runtime_cfg = cfg;
+    runtime_cfg.gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url);
+
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
-    var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
+    var ctx = AskContext.init(alloc, runtime_cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
@@ -1569,8 +1572,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
-        .gateway_retry_count = cfg.gateway_retry_count,
-        .gateway_chat_url = cfg.gateway_chat_url,
+        .gateway_retry_count = ctx.cfg.gateway_retry_count,
+        .gateway_chat_url = ctx.cfg.gateway_chat_url,
         .gateway_tools_json = tool_projection.tools_json,
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,

@@ -2647,6 +2647,7 @@ fn processQueuedPromptLoop(
                     .provider_options = provider_opts,
                     .max_output_tokens = request_max_output_tokens(request_capabilities),
                     .budget = .{ .cancel_flag = config.cancel_flag },
+                    .chat_url = config.gateway_chat_url,
                 },
             ) catch |err| {
                 if (err == error.Cancelled) {

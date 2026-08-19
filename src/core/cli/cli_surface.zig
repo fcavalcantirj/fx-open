@@ -21,6 +21,7 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const credentials = @import("../auth/credentials.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -2653,7 +2654,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .default_model = cfg.default_model,
         .default_agent_step_limit = cfg.default_agent_step_limit,
         .gateway_retry_count = cfg.gateway_retry_count,
-        .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
+        .gateway_chat_url = cfg.gateway_chat_url,
         .gateway_models_path = cfg.models_path,
         .gateway_provider = cfg.gateway_provider,
         .background_process_provider = cfg.background_process_provider,
@@ -4220,7 +4221,9 @@ test "workflow config does not carry placeholder gateway tools" {
     try std.testing.expect(!@hasField(@TypeOf(cfg), "gateway_tools_json"));
     try std.testing.expect(!@hasField(@TypeOf(cfg), "context_registry"));
     try std.testing.expectEqualStrings("test-model", cfg.default_model);
-    try std.testing.expectEqualStrings("http://127.0.0.1:43123/chat", cfg.gateway_chat_url);
+    try std.testing.expectEqualStrings("https://example.test/chat", cfg.gateway_chat_url);
+    const resolved = surface_cfg.gateway_provider.chat_url.resolve(surface_cfg.gateway_chat_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:43123/chat", resolved);
     try std.testing.expect(chat_url_probe.called);
     try std.testing.expectEqualStrings("surface", cfg.mode_registry.default_mode_id);
     try std.testing.expectEqualStrings("skills", cfg.skill_root_policy.workspace_roots[0].path);
@@ -4590,18 +4593,22 @@ test "runIfRequested credits failures use nonzero text and json contracts" {
 }
 
 test "runIfRequested local json success appends exactly one newline" {
-    var capture = CaptureOutput.init(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    var capture = CaptureOutput.init(alloc);
     defer capture.deinit();
 
     var deps = capture.deps();
     deps.load_startup_status = stubLoadStartupStatus;
 
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
+    const result = try runIfRequestedWithDeps(alloc, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
-        capture.stdout.written(),
+    const expected = try std.fmt.allocPrint(
+        alloc,
+        "{{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"{s}\",\"permission_mode\":\"auto\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}}\n",
+        .{credentials.missing_credential_message},
     );
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, capture.stdout.written());
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
 }
 
@@ -4673,7 +4680,8 @@ test "status and doctor inspect the supplied MCP profile diagnostic once" {
 }
 
 test "writeRenderedJsonLine falls back to heap and appends exactly one newline" {
-    var capture = CaptureOutput.init(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    var capture = CaptureOutput.init(alloc);
     defer capture.deinit();
 
     var tiny_buf: [8]u8 = undefined;
@@ -4685,16 +4693,19 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     };
 
     try writeRenderedJsonLine(
-        std.testing.allocator,
+        alloc,
         capture.deps(),
         tiny_buf[0..],
         .{ .status = statusSnapshotFromStartup(startup) },
     );
 
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
-        capture.stdout.written(),
+    const expected = try std.fmt.allocPrint(
+        alloc,
+        "{{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"{s}\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}}\n",
+        .{credentials.missing_credential_message},
     );
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, capture.stdout.written());
 }
 
 test "status snapshot reports yolo effective sandbox without mutating startup" {
