@@ -290,6 +290,7 @@ fn consumeOpenAiSseStream(
     }
 
     var completion: types.GatewayCompletion = .{};
+    errdefer gateway_json.freeGatewayCompletion(alloc, completion);
     if (content_buf.items.len > 0) {
         completion.content = try alloc.dupe(u8, content_buf.items);
     }
@@ -299,6 +300,13 @@ fn consumeOpenAiSseStream(
         const buffer = try alloc.alloc(types.ToolCall, streamed_tools.items.len);
         errdefer alloc.free(buffer);
         var count: usize = 0;
+        errdefer {
+            for (buffer[0..count]) |call| {
+                alloc.free(call.id);
+                alloc.free(call.name);
+                alloc.free(call.arguments_json);
+            }
+        }
         for (streamed_tools.items) |tool| {
             if (tool.id.items.len == 0 or tool.name.items.len == 0) continue;
             const args = if (tool.arguments.items.len == 0) "{}" else tool.arguments.items;
@@ -323,9 +331,6 @@ fn consumeOpenAiSseStream(
     return .{ .status = .ok, .completion = completion };
 }
 
-/// Many OpenAI-compatible servers (LiteLLM, Ollama, older proxies) stream function
-/// tool calls but finish with `stop` instead of OpenAI's `tool_calls`. Treat that
-/// as a tool-call completion so local tools can run.
 fn normalizeOpenAiToolFinishReason(completion: *types.GatewayCompletion) void {
     if (completion.tool_calls.len == 0) return;
     if (types.allToolCallsProviderExecuted(completion.tool_calls)) return;
@@ -337,6 +342,14 @@ fn normalizeOpenAiToolFinishReason(completion: *types.GatewayCompletion) void {
         .stop, .other => completion.finish_reason = .tool_calls,
         else => {},
     }
+}
+
+fn validatedStreamedToolIndex(index_value: std.json.Value) ?usize {
+    if (index_value != .integer) return null;
+    if (index_value.integer < 0) return null;
+    const index = std.math.cast(usize, index_value.integer) orelse return null;
+    if (index > openai_transport.max_streamed_tool_index) return null;
+    return index;
 }
 
 fn handleOpenAiChunk(
@@ -385,8 +398,7 @@ fn handleOpenAiChunk(
     for (tool_calls.array.items) |tool_call| {
         if (tool_call != .object) continue;
         const index_value = tool_call.object.get("index") orelse continue;
-        if (index_value != .integer) continue;
-        const index: usize = @intCast(index_value.integer);
+        const index = validatedStreamedToolIndex(index_value) orelse return error.InvalidGatewayResponse;
         while (streamed_tools.items.len <= index) {
             try streamed_tools.append(alloc, .{});
         }

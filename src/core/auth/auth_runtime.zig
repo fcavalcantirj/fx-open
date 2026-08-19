@@ -604,6 +604,7 @@ pub const Runtime = struct {
     api_key_input: std.ArrayList(u8) = .empty,
     api_key_returns_to_root: bool = false,
     api_key_save: ApiKeySaveRuntime = .{},
+    transport_route: openai_transport.TransportRoute = .{},
 
     pub fn init(
         validator: api_key_validator.Provider,
@@ -624,7 +625,21 @@ pub const Runtime = struct {
         self.clearTeamSelection(alloc);
         self.team_query.deinit(alloc);
         if (self.selected_credential) |*credential| credential.deinit(alloc);
+        self.transport_route.deinit(alloc);
         self.* = .{};
+    }
+
+    pub fn gatewayChatUrl(self: *const Self, gateway_fallback: []const u8) []const u8 {
+        const base = self.transport_route.chatUrl(gateway_fallback);
+        return openai_transport.resolveGatewayChatUrl(
+            base,
+            io_mod.getenv(openai_transport.gateway_chat_url_env),
+        );
+    }
+
+    fn refreshTransportRoute(self: *Self, alloc: Allocator) !void {
+        self.transport_route.deinit(alloc);
+        self.transport_route = try openai_transport.buildTransportRoute(alloc, self.credentialSource());
     }
 
     /// Borrows the current credential until this runtime replaces or releases it.
@@ -1087,7 +1102,9 @@ pub const Runtime = struct {
         credential.team_slug = null;
         self.source_inventory.insert(source);
         if (source == .stored_key) self.stored_key_status = .not_attempted;
-        openai_transport.setActiveOpenAiMode(openai_transport.isOpenAiCredentialSource(source));
+        self.refreshTransportRoute(alloc) catch {
+            self.transport_route = .{};
+        };
         return changed;
     }
 
@@ -1153,7 +1170,7 @@ pub const Runtime = struct {
         if (self.selected_credential) |*credential| credential.deinit(alloc);
         self.selected_credential = null;
         self.credential_refresh_failure_source = null;
-        openai_transport.setActiveOpenAiMode(false);
+        try self.refreshTransportRoute(alloc);
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
         for (credential_source_order) |source| {
@@ -1188,7 +1205,7 @@ pub const Runtime = struct {
             if (self.selected_credential) |*credential| credential.deinit(alloc);
             self.selected_credential = null;
             self.credential_refresh_failure_source = null;
-            openai_transport.setActiveOpenAiMode(false);
+            try self.refreshTransportRoute(alloc);
         }
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
@@ -1521,6 +1538,31 @@ test "catalog access records a refresh failure until another credential is adopt
 
     const authenticated = runtime.modelCatalogAccess();
     try std.testing.expectEqualStrings("api-key", authenticated.authorizationCredential().?);
+}
+
+test "auth runtime rebuilds transport route when credential changes" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var gateway = try makeTestCredential(alloc, "gw-key", .ai_gateway_api_key, null, null);
+    defer gateway.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &gateway);
+    try std.testing.expect(!runtime.transport_route.uses_openai_wire);
+    try std.testing.expectEqualStrings(
+        "https://ai-gateway.vercel.sh/v3/ai/language-model",
+        runtime.gatewayChatUrl("https://ai-gateway.vercel.sh/v3/ai/language-model"),
+    );
+
+    var openai = try makeTestCredential(alloc, "oa-key", .openai_api_key, null, null);
+    defer openai.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &openai);
+    try std.testing.expect(runtime.transport_route.uses_openai_wire);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        runtime.gatewayChatUrl("https://ai-gateway.vercel.sh/v3/ai/language-model"),
+        openai_transport.chat_completions_suffix,
+    ));
 }
 
 test "auth runtime adopts credential ownership and prefers team id" {

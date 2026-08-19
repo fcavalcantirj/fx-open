@@ -2,6 +2,8 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 
+pub const gateway_chat_url_env = "FX_GATEWAY_CHAT_URL";
+
 pub const openai_api_key_env = "OPENAI_API_KEY";
 pub const openai_base_url_env = "FX_OPENAI_BASE_URL";
 pub const openai_api_style_env = "FX_OPENAI_API_STYLE";
@@ -42,35 +44,146 @@ fn nonEmptyEnv(name: []const u8) ?[]const u8 {
     return raw;
 }
 
-pub fn resolveBaseUrl() []const u8 {
-    if (!active_openai_mode) return default_base_url;
+pub fn resolveOpenAiBaseUrl() []const u8 {
     if (nonEmptyEnv(openai_base_url_env)) |value| return value;
     if (profileBaseUrl()) |url| return url;
     return default_base_url;
 }
 
+/// Immutable routing snapshot for one credential selection. Built when the
+/// credential changes and carried with each request so in-flight workers cannot
+/// observe a different transport mode than the credential they were started with.
+pub const TransportRoute = struct {
+    uses_openai_wire: bool = false,
+    openai_wire_url: []u8 = "",
+    openai_models_url: []u8 = "",
+
+    pub const gateway = TransportRoute{};
+
+    pub fn deinit(self: *TransportRoute, alloc: std.mem.Allocator) void {
+        if (self.openai_wire_url.len > 0) alloc.free(self.openai_wire_url);
+        if (self.openai_models_url.len > 0) alloc.free(self.openai_models_url);
+        self.* = .{};
+    }
+
+    pub fn chatUrl(self: TransportRoute, gateway_fallback: []const u8) []const u8 {
+        if (self.uses_openai_wire) return self.openai_wire_url;
+        return gateway_fallback;
+    }
+
+    pub fn usesOpenAiWire(self: TransportRoute) bool {
+        return self.uses_openai_wire;
+    }
+};
+
+pub fn buildTransportRoute(
+    alloc: std.mem.Allocator,
+    source: ?types.CredentialSource,
+) !TransportRoute {
+    const selected = source orelse return .{};
+    if (!isOpenAiCredentialSource(selected)) return .{};
+
+    const base = resolveOpenAiBaseUrl();
+    const style = resolveOpenAiApiStyle();
+    const wire_url = formatWireUrl(alloc, base, style) catch |err| switch (err) {
+        error.OpenAiWireUrlTooLong => try alloc.dupe(u8, ""),
+        else => return err,
+    };
+    errdefer alloc.free(wire_url);
+    const models_url = try formatModelsUrl(alloc, base);
+    errdefer alloc.free(models_url);
+
+    return .{
+        .uses_openai_wire = wire_url.len > 0,
+        .openai_wire_url = wire_url,
+        .openai_models_url = models_url,
+    };
+}
+
+pub fn formatWireUrl(
+    alloc: std.mem.Allocator,
+    base_url: []const u8,
+    style: ApiStyle,
+) ![]u8 {
+    var buf: [1024]u8 = undefined;
+    const formatted = switch (style) {
+        .chat => formatChatUrl(&buf, base_url),
+        .responses => formatResponsesUrl(&buf, base_url),
+    } catch {
+        if (!std.mem.eql(u8, base_url, default_base_url)) return error.OpenAiWireUrlTooLong;
+        const suffix = switch (style) {
+            .chat => chat_completions_suffix,
+            .responses => responses_suffix,
+        };
+        return std.fmt.allocPrint(alloc, "{s}{s}", .{ default_base_url, suffix });
+    };
+    return try alloc.dupe(u8, formatted);
+}
+
+pub fn resolveGatewayChatUrl(fallback: []const u8, override: ?[]const u8) []const u8 {
+    const candidate = override orelse return fallback;
+    if (!isLoopbackHttpUrl(candidate)) return fallback;
+    return candidate;
+}
+
+fn isLoopbackHttpUrl(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") or
+        uri.user != null or
+        uri.password != null or
+        uri.port == null)
+    {
+        return false;
+    }
+
+    const host_component = uri.host orelse return false;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = host_component.toRaw(&host_buf) catch return false;
+    return std.mem.eql(u8, host, "127.0.0.1") or
+        std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.mem.eql(u8, host, "[::1]");
+}
+
 var profile_base_url_storage: [512]u8 = undefined;
 var profile_base_url_len: usize = 0;
+var profile_openai_api_key_storage: [512]u8 = undefined;
+var profile_openai_api_key_len: usize = 0;
 var profile_api_style: ApiStyle = .chat;
 var profile_api_style_configured: bool = false;
-var active_openai_mode: bool = false;
 
-pub fn setActiveOpenAiMode(active: bool) void {
-    active_openai_mode = active;
+/// Returns false when a non-empty profile key exceeds the fixed storage cap.
+pub fn configureProfileApiKey(key: ?[]const u8) bool {
+    profile_openai_api_key_len = 0;
+    if (key) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len == 0) return true;
+        if (trimmed.len > profile_openai_api_key_storage.len) return false;
+        @memcpy(profile_openai_api_key_storage[0..trimmed.len], trimmed);
+        profile_openai_api_key_len = trimmed.len;
+    }
+    return true;
 }
 
-pub fn isActiveOpenAiMode() bool {
-    return active_openai_mode;
+pub fn profileOpenAiApiKey() ?[]const u8 {
+    if (profile_openai_api_key_len == 0) return null;
+    return profile_openai_api_key_storage[0..profile_openai_api_key_len];
 }
 
-pub fn configureProfileBaseUrl(url: ?[]const u8) void {
+pub fn profileOpenAiApiKeyPresent() bool {
+    return profileOpenAiApiKey() != null;
+}
+
+/// Returns false when a non-empty profile URL exceeds the fixed storage cap.
+pub fn configureProfileBaseUrl(url: ?[]const u8) bool {
     profile_base_url_len = 0;
     if (url) |value| {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        if (trimmed.len == 0 or trimmed.len > profile_base_url_storage.len) return;
+        if (trimmed.len == 0) return true;
+        if (trimmed.len > profile_base_url_storage.len) return false;
         @memcpy(profile_base_url_storage[0..trimmed.len], trimmed);
         profile_base_url_len = trimmed.len;
     }
+    return true;
 }
 
 pub fn configureProfileApiStyle(style: ?[]const u8) void {
@@ -86,7 +199,7 @@ pub fn configureProfileApiStyle(style: ?[]const u8) void {
     }
 }
 
-pub fn resolveApiStyle() ApiStyle {
+pub fn resolveOpenAiApiStyle() ApiStyle {
     if (nonEmptyEnv(openai_api_style_env)) |value| {
         if (ApiStyle.parse(value)) |parsed| return parsed;
     }
@@ -159,6 +272,8 @@ pub fn formatResponsesUrl(buf: []u8, base_url: []const u8) ![]const u8 {
     return buf[0 .. trimmed.len + 1 + path_suffix.len];
 }
 
+pub const max_streamed_tool_index: usize = 64;
+
 pub fn formatModelsUrl(alloc: std.mem.Allocator, base_url: []const u8) ![]u8 {
     const trimmed = std.mem.trimEnd(u8, base_url, "/");
     if (std.mem.endsWith(u8, trimmed, "/models")) {
@@ -171,18 +286,32 @@ pub fn formatModelsUrl(alloc: std.mem.Allocator, base_url: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}{s}", .{ trimmed, suffix });
 }
 
-test "isActiveOpenAiMode follows selected credential flag only" {
-    setActiveOpenAiMode(false);
-    try std.testing.expect(!isActiveOpenAiMode());
-    setActiveOpenAiMode(true);
-    defer setActiveOpenAiMode(false);
-    try std.testing.expect(isActiveOpenAiMode());
-}
-
-test "resolveApiStyle uses profile when env unset" {
+test "buildTransportRoute snapshots OpenAI wire endpoints for OpenAI credentials" {
+    const alloc = std.testing.allocator;
     configureProfileApiStyle("responses");
     defer configureProfileApiStyle(null);
-    try std.testing.expectEqual(ApiStyle.responses, resolveApiStyle());
+    try std.testing.expect(configureProfileBaseUrl("https://litellm.example/v1"));
+    defer configureProfileBaseUrl(null);
+
+    var route = try buildTransportRoute(alloc, .openai_api_key);
+    defer route.deinit(alloc);
+    try std.testing.expect(route.uses_openai_wire);
+    try std.testing.expectEqualStrings("https://litellm.example/v1/responses", route.openai_wire_url);
+    try std.testing.expectEqualStrings("https://litellm.example/v1/models", route.openai_models_url);
+}
+
+test "buildTransportRoute returns gateway route for non-OpenAI credentials" {
+    const alloc = std.testing.allocator;
+    var route = try buildTransportRoute(alloc, .ai_gateway_api_key);
+    defer route.deinit(alloc);
+    try std.testing.expect(!route.uses_openai_wire);
+    try std.testing.expectEqualStrings("https://gateway.example/chat", route.chatUrl("https://gateway.example/chat"));
+}
+
+test "resolveOpenAiApiStyle uses profile when env unset" {
+    configureProfileApiStyle("responses");
+    defer configureProfileApiStyle(null);
+    try std.testing.expectEqual(ApiStyle.responses, resolveOpenAiApiStyle());
 }
 
 test "ApiStyle parse accepts chat and responses" {
@@ -198,6 +327,16 @@ test "formatResponsesUrl composes base and suffix" {
 
     const ollama = try formatResponsesUrl(&buf, "http://127.0.0.1:11434/v1/");
     try std.testing.expectEqualStrings("http://127.0.0.1:11434/v1/responses", ollama);
+}
+
+test "configureProfileBaseUrl rejects oversized profile URLs" {
+    var oversized: [513]u8 = undefined;
+    @memset(&oversized, 'a');
+    try std.testing.expect(!configureProfileBaseUrl(oversized[0..]));
+
+    try std.testing.expect(configureProfileBaseUrl("https://litellm.example/v1"));
+    defer configureProfileBaseUrl(null);
+    try std.testing.expectEqualStrings("https://litellm.example/v1", resolveOpenAiBaseUrl());
 }
 
 test "formatChatUrl composes base and suffix" {

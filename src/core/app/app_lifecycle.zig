@@ -152,6 +152,7 @@ pub const StartupState = struct {
     notification_attention_required: bool = false,
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
+    transport_route: openai_transport.TransportRoute = .{},
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
         self.workspace_access.deinit(alloc);
@@ -164,6 +165,7 @@ pub const StartupState = struct {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
             alloc.free(self.config_diagnostics);
         }
+        self.transport_route.deinit(alloc);
         self.* = .{ .agent_step_limit = self.agent_step_limit };
     }
 
@@ -193,6 +195,14 @@ pub const StartupState = struct {
         const credential = self.credential orelse return null;
         if (credential.needsRefreshAt(io_mod.milliTimestamp())) return null;
         return credential.gatewayTeam();
+    }
+
+    pub fn gatewayChatUrl(self: *const StartupState, gateway_fallback: []const u8) []const u8 {
+        const base = self.transport_route.chatUrl(gateway_fallback);
+        return openai_transport.resolveGatewayChatUrl(
+            base,
+            io_mod.getenv(openai_transport.gateway_chat_url_env),
+        );
     }
 
     pub fn takeCredential(self: *StartupState) ?credentials.Credential {
@@ -382,7 +392,12 @@ fn loadStartupStateFromOwnedWorkspace(
         try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
-    openai_transport.configureProfileBaseUrl(settings.openai_base_url);
+    if (!openai_transport.configureProfileBaseUrl(settings.openai_base_url)) {
+        debug_trace.logf("config", "openai_base_url exceeds 512-byte limit; ignored", .{});
+    }
+    if (!openai_transport.configureProfileApiKey(settings.openai_api_key)) {
+        debug_trace.logf("config", "openai_api_key exceeds 512-byte limit; ignored", .{});
+    }
     openai_transport.configureProfileApiStyle(settings.openai_api_style);
 
     state.workspace_access = try workspace_access.WorkspaceAccess.init(
@@ -415,9 +430,7 @@ fn loadStartupStateFromOwnedWorkspace(
             }
         }
         if (state.credential) |credential| {
-            openai_transport.setActiveOpenAiMode(
-                openai_transport.isOpenAiCredentialSource(credential.source),
-            );
+            state.transport_route = openai_transport.buildTransportRoute(alloc, credential.source) catch .{};
         }
         state.stored_key_status = resolution.stored_key_status;
     }

@@ -1345,7 +1345,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
 
     var runtime_cfg = cfg;
-    runtime_cfg.gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url);
+    runtime_cfg.gateway_chat_url = startup.gatewayChatUrl(cfg.gateway_chat_url);
 
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);

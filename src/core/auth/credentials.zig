@@ -6,6 +6,7 @@ const io_mod = @import("../shared/io.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
 
@@ -271,6 +272,9 @@ fn loadPreferredSource(
     mode: LoadMode,
     source: Source,
 ) !?Credential {
+    if (source == .openai_api_key) {
+        return loadOpenAiApiKeyCredentialWithProfile(alloc, source, true);
+    }
     if (source != .fx_login) return loadSource(alloc, transport, secret_store, source);
     return switch (mode) {
         .stored => loadStoredFxLoginCredential(alloc),
@@ -331,12 +335,28 @@ pub fn sourceExists(
 }
 
 fn openAiApiKeyEnvPresent() bool {
-    return nonEmptyEnvValue("OPENAI_API_KEY") != null or nonEmptyEnvValue("LITELLM_API_KEY") != null;
+    return nonEmptyEnvValue("OPENAI_API_KEY") != null or
+        nonEmptyEnvValue("LITELLM_API_KEY") != null or
+        openai_transport.profileOpenAiApiKeyPresent();
 }
 
 fn loadOpenAiApiKeyCredential(alloc: std.mem.Allocator, source: Source) !?Credential {
+    return loadOpenAiApiKeyCredentialWithProfile(alloc, source, false);
+}
+
+fn loadOpenAiApiKeyCredentialWithProfile(
+    alloc: std.mem.Allocator,
+    source: Source,
+    include_profile: bool,
+) !?Credential {
     if (try loadEnvCredential(alloc, "OPENAI_API_KEY", source)) |credential| return credential;
-    return try loadEnvCredential(alloc, "LITELLM_API_KEY", source);
+    if (try loadEnvCredential(alloc, "LITELLM_API_KEY", source)) |credential| return credential;
+    if (!include_profile) return null;
+    const profile_key = openai_transport.profileOpenAiApiKey() orelse return null;
+    return .{
+        .token = try alloc.dupe(u8, profile_key),
+        .source = source,
+    };
 }
 
 fn loadEnvCredential(
@@ -735,6 +755,35 @@ test "source-specific credential loading bypasses generic precedence" {
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .ai_gateway_api_key));
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .vercel_oidc_token));
     try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .stored_key)));
+}
+
+test "openai credential loads profile key for preferred source when env unset" {
+    const alloc = std.testing.allocator;
+    openai_transport.configureProfileApiKey("profile-openai-key");
+    defer openai_transport.configureProfileApiKey(null);
+
+    var credential = (try loadOpenAiApiKeyCredentialWithProfile(alloc, .openai_api_key, true)).?;
+    defer credential.deinit(alloc);
+    try std.testing.expectEqualStrings("profile-openai-key", credential.token);
+    try std.testing.expectEqual(Source.openai_api_key, credential.source);
+    try std.testing.expect((try loadOpenAiApiKeyCredential(alloc, .openai_api_key)) == null);
+}
+
+test "remembered openai choice resolves profile key before fx login" {
+    const alloc = std.testing.allocator;
+    openai_transport.configureProfileApiKey("profile-openai-key");
+    defer openai_transport.configureProfileApiKey(null);
+
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "AI_GATEWAY_API_KEY", "api-key" },
+    });
+    defer env.deinit();
+
+    const resolution = try resolvePreferring(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .openai_api_key);
+    var credential = resolution.credential orelse return error.TestExpectedCredential;
+    defer credential.deinit(alloc);
+    try std.testing.expectEqual(Source.openai_api_key, credential.source);
+    try std.testing.expectEqualStrings("profile-openai-key", credential.token);
 }
 
 test "openai credential loads OPENAI_API_KEY before LITELLM_API_KEY" {

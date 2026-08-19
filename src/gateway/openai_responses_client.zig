@@ -331,6 +331,7 @@ fn consumeResponsesSseStream(
     }
 
     var completion: types.GatewayCompletion = .{};
+    errdefer gateway_json.freeGatewayCompletion(alloc, completion);
     if (content_buf.items.len > 0) {
         completion.content = try alloc.dupe(u8, content_buf.items);
     }
@@ -340,6 +341,13 @@ fn consumeResponsesSseStream(
         const buffer = try alloc.alloc(types.ToolCall, streamed_tools.items.len);
         errdefer alloc.free(buffer);
         var count: usize = 0;
+        errdefer {
+            for (buffer[0..count]) |call| {
+                alloc.free(call.id);
+                alloc.free(call.name);
+                alloc.free(call.arguments_json);
+            }
+        }
         for (streamed_tools.items) |tool| {
             if (tool.id.items.len == 0 or tool.name.items.len == 0) continue;
             const args = if (tool.arguments.items.len == 0) "{}" else tool.arguments.items;
@@ -377,10 +385,19 @@ fn ensureToolIndex(
     streamed_tools: *std.ArrayList(StreamedToolCall),
     output_index: usize,
 ) !*StreamedToolCall {
+    if (output_index > openai_transport.max_streamed_tool_index) return error.InvalidGatewayResponse;
     while (streamed_tools.items.len <= output_index) {
         try streamed_tools.append(alloc, .{});
     }
     return &streamed_tools.items[output_index];
+}
+
+fn validatedStreamedToolIndex(index_value: std.json.Value) ?usize {
+    if (index_value != .integer) return null;
+    if (index_value.integer < 0) return null;
+    const index = std.math.cast(usize, index_value.integer) orelse return null;
+    if (index > openai_transport.max_streamed_tool_index) return null;
+    return index;
 }
 
 fn announceToolIfReady(
@@ -435,8 +452,7 @@ fn handleResponsesEvent(
         const item_type = item.object.get("type") orelse return;
         if (item_type != .string or !std.mem.eql(u8, item_type.string, "function_call")) return;
         const output_index_value = parsed.value.object.get("output_index") orelse return;
-        if (output_index_value != .integer) return;
-        const output_index: usize = @intCast(output_index_value.integer);
+        const output_index = validatedStreamedToolIndex(output_index_value) orelse return error.InvalidGatewayResponse;
         const record = try ensureToolIndex(alloc, streamed_tools, output_index);
         if (item.object.get("call_id")) |call_id| {
             if (call_id == .string and call_id.string.len > 0) {
@@ -462,8 +478,7 @@ fn handleResponsesEvent(
 
     if (std.mem.eql(u8, event_name, "response.function_call_arguments.delta")) {
         const output_index_value = parsed.value.object.get("output_index") orelse return;
-        if (output_index_value != .integer) return;
-        const output_index: usize = @intCast(output_index_value.integer);
+        const output_index = validatedStreamedToolIndex(output_index_value) orelse return error.InvalidGatewayResponse;
         const delta_value = parsed.value.object.get("delta") orelse return;
         if (delta_value != .string or delta_value.string.len == 0) return;
         const record = try ensureToolIndex(alloc, streamed_tools, output_index);
@@ -474,8 +489,7 @@ fn handleResponsesEvent(
 
     if (std.mem.eql(u8, event_name, "response.function_call_arguments.done")) {
         const output_index_value = parsed.value.object.get("output_index") orelse return;
-        if (output_index_value != .integer) return;
-        const output_index: usize = @intCast(output_index_value.integer);
+        const output_index = validatedStreamedToolIndex(output_index_value) orelse return error.InvalidGatewayResponse;
         const record = try ensureToolIndex(alloc, streamed_tools, output_index);
         if (parsed.value.object.get("name")) |name| {
             if (name == .string and name.string.len > 0) {
