@@ -635,7 +635,7 @@ test "TypedSseEventReader preserves large data payloads across events" {
         lines: []const []const u8,
         index: usize = 0,
 
-        pub fn takeDelimiter(self: *@This(), delimiter: u8) !?[]const u8 {
+        pub fn takeDelimiter(self: *@This(), delimiter: u8) error{ StreamTooLong, ReadFailed }!?[]const u8 {
             _ = delimiter;
             if (self.index >= self.lines.len) return null;
             const line = self.lines[self.index];
@@ -658,11 +658,11 @@ test "TypedSseEventReader preserves large data payloads across events" {
         "data: {\"type\":\"response.completed\"}",
         "",
     };
-    const reader = LineReader{ .lines = lines[0..] };
+    var reader = LineReader{ .lines = lines[0..] };
     var event_reader = TypedSseEventReader{ .max_line_bytes = max_sse_event_line_bytes };
     defer event_reader.deinit(alloc);
 
-    const first = (try event_reader.next(alloc, reader)).?;
+    const first = (try event_reader.next(alloc, &reader)).?;
     defer {
         if (first.event_type) |value| alloc.free(value);
         if (first.data) |value| alloc.free(value);
@@ -670,7 +670,7 @@ test "TypedSseEventReader preserves large data payloads across events" {
     try std.testing.expectEqualStrings("response.output_text.delta", first.event_type.?);
     try std.testing.expect(first.data.?.len > large_delta.len);
 
-    const second = (try event_reader.next(alloc, reader)).?;
+    const second = (try event_reader.next(alloc, &reader)).?;
     defer {
         if (second.event_type) |value| alloc.free(value);
         if (second.data) |value| alloc.free(value);
@@ -695,7 +695,7 @@ test "TypedSseEventReader clears pending_line after StreamTooLong chunks" {
         phase: u8 = 0,
         payload: []const u8,
 
-        pub fn takeDelimiter(self: *@This(), delimiter: u8) !?[]const u8 {
+        pub fn takeDelimiter(self: *@This(), delimiter: u8) error{ StreamTooLong, ReadFailed }!?[]const u8 {
             _ = delimiter;
             self.phase += 1;
             return switch (self.phase) {
@@ -717,11 +717,11 @@ test "TypedSseEventReader clears pending_line after StreamTooLong chunks" {
         pub fn tossBuffered(_: *@This()) void {}
     };
 
-    const reader = OverflowReader{ .payload = payload };
+    var reader = OverflowReader{ .payload = payload };
     var event_reader = TypedSseEventReader{ .max_line_bytes = max_sse_event_line_bytes };
     defer event_reader.deinit(alloc);
 
-    const first = (try event_reader.next(alloc, reader)).?;
+    const first = (try event_reader.next(alloc, &reader)).?;
     defer {
         if (first.event_type) |value| alloc.free(value);
         if (first.data) |value| alloc.free(value);
@@ -729,7 +729,7 @@ test "TypedSseEventReader clears pending_line after StreamTooLong chunks" {
     try std.testing.expectEqualStrings("response.output_text.delta", first.event_type.?);
     try std.testing.expect(first.data.?.len > large_delta.len);
 
-    const second = (try event_reader.next(alloc, reader)).?;
+    const second = (try event_reader.next(alloc, &reader)).?;
     defer {
         if (second.event_type) |value| alloc.free(value);
         if (second.data) |value| alloc.free(value);

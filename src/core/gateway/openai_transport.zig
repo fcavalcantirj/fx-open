@@ -16,6 +16,12 @@ pub const e2e_openai_chat_url_env = "FX_E2E_OPENAI_CHAT_URL";
 pub const e2e_openai_responses_url_env = "FX_E2E_OPENAI_RESPONSES_URL";
 pub const e2e_openai_models_url_env = "FX_E2E_OPENAI_MODELS_URL";
 
+pub const WireKind = enum {
+    gateway,
+    openai_chat,
+    openai_responses,
+};
+
 pub const ApiStyle = enum {
     chat,
     responses,
@@ -54,25 +60,21 @@ pub fn resolveOpenAiBaseUrl() []const u8 {
 /// credential changes and carried with each request so in-flight workers cannot
 /// observe a different transport mode than the credential they were started with.
 pub const TransportRoute = struct {
-    uses_openai_wire: bool = false,
-    openai_wire_url: []u8 = "",
-    openai_models_url: []u8 = "",
+    wire_kind: WireKind = .gateway,
+    wire_url: []u8 = "",
+    models_url: []u8 = "",
 
     pub const gateway = TransportRoute{};
 
     pub fn deinit(self: *TransportRoute, alloc: std.mem.Allocator) void {
-        if (self.openai_wire_url.len > 0) alloc.free(self.openai_wire_url);
-        if (self.openai_models_url.len > 0) alloc.free(self.openai_models_url);
+        if (self.wire_url.len > 0) alloc.free(self.wire_url);
+        if (self.models_url.len > 0) alloc.free(self.models_url);
         self.* = .{};
     }
 
     pub fn chatUrl(self: TransportRoute, gateway_fallback: []const u8) []const u8 {
-        if (self.uses_openai_wire) return self.openai_wire_url;
+        if (self.wire_kind != .gateway) return self.wire_url;
         return gateway_fallback;
-    }
-
-    pub fn usesOpenAiWire(self: TransportRoute) bool {
-        return self.uses_openai_wire;
     }
 };
 
@@ -92,11 +94,15 @@ pub fn buildTransportRoute(
     errdefer alloc.free(wire_url);
     const models_url = try formatModelsUrl(alloc, base);
     errdefer alloc.free(models_url);
+    const wire_kind: WireKind = if (wire_url.len == 0) .gateway else switch (style) {
+        .chat => .openai_chat,
+        .responses => .openai_responses,
+    };
 
     return .{
-        .uses_openai_wire = wire_url.len > 0,
-        .openai_wire_url = wire_url,
-        .openai_models_url = models_url,
+        .wire_kind = wire_kind,
+        .wire_url = wire_url,
+        .models_url = models_url,
     };
 }
 
@@ -212,18 +218,6 @@ fn profileBaseUrl() ?[]const u8 {
     return profile_base_url_storage[0..profile_base_url_len];
 }
 
-pub fn isOpenAiChatUrl(chat_url: []const u8) bool {
-    return std.mem.endsWith(u8, chat_url, chat_completions_suffix);
-}
-
-pub fn isOpenAiResponsesUrl(chat_url: []const u8) bool {
-    return std.mem.endsWith(u8, chat_url, responses_suffix);
-}
-
-pub fn isOpenAiWireUrl(chat_url: []const u8) bool {
-    return isOpenAiChatUrl(chat_url) or isOpenAiResponsesUrl(chat_url);
-}
-
 /// Writes `{base}/chat/completions` into `buf` and returns the used slice.
 pub fn formatChatUrl(buf: []u8, base_url: []const u8) ![]const u8 {
     const trimmed = std.mem.trimEnd(u8, base_url, "/");
@@ -291,20 +285,22 @@ test "buildTransportRoute snapshots OpenAI wire endpoints for OpenAI credentials
     configureProfileApiStyle("responses");
     defer configureProfileApiStyle(null);
     try std.testing.expect(configureProfileBaseUrl("https://litellm.example/v1"));
-    defer configureProfileBaseUrl(null);
+    defer {
+        _ = configureProfileBaseUrl(null);
+    }
 
     var route = try buildTransportRoute(alloc, .openai_api_key);
     defer route.deinit(alloc);
-    try std.testing.expect(route.uses_openai_wire);
-    try std.testing.expectEqualStrings("https://litellm.example/v1/responses", route.openai_wire_url);
-    try std.testing.expectEqualStrings("https://litellm.example/v1/models", route.openai_models_url);
+    try std.testing.expectEqual(WireKind.openai_responses, route.wire_kind);
+    try std.testing.expectEqualStrings("https://litellm.example/v1/responses", route.wire_url);
+    try std.testing.expectEqualStrings("https://litellm.example/v1/models", route.models_url);
 }
 
 test "buildTransportRoute returns gateway route for non-OpenAI credentials" {
     const alloc = std.testing.allocator;
     var route = try buildTransportRoute(alloc, .ai_gateway_api_key);
     defer route.deinit(alloc);
-    try std.testing.expect(!route.uses_openai_wire);
+    try std.testing.expectEqual(WireKind.gateway, route.wire_kind);
     try std.testing.expectEqualStrings("https://gateway.example/chat", route.chatUrl("https://gateway.example/chat"));
 }
 
@@ -335,7 +331,9 @@ test "configureProfileBaseUrl rejects oversized profile URLs" {
     try std.testing.expect(!configureProfileBaseUrl(oversized[0..]));
 
     try std.testing.expect(configureProfileBaseUrl("https://litellm.example/v1"));
-    defer configureProfileBaseUrl(null);
+    defer {
+        _ = configureProfileBaseUrl(null);
+    }
     try std.testing.expectEqualStrings("https://litellm.example/v1", resolveOpenAiBaseUrl());
 }
 

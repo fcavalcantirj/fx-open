@@ -205,6 +205,10 @@ pub const StartupState = struct {
         );
     }
 
+    pub fn gatewayWireKind(self: *const StartupState) openai_transport.WireKind {
+        return self.transport_route.wire_kind;
+    }
+
     pub fn takeCredential(self: *StartupState) ?credentials.Credential {
         const value = self.credential;
         self.credential = null;

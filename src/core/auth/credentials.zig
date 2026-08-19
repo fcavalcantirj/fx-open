@@ -759,8 +759,8 @@ test "source-specific credential loading bypasses generic precedence" {
 
 test "openai credential loads profile key for preferred source when env unset" {
     const alloc = std.testing.allocator;
-    openai_transport.configureProfileApiKey("profile-openai-key");
-    defer openai_transport.configureProfileApiKey(null);
+    try std.testing.expect(openai_transport.configureProfileApiKey("profile-openai-key"));
+    defer _ = openai_transport.configureProfileApiKey(null);
 
     var credential = (try loadOpenAiApiKeyCredentialWithProfile(alloc, .openai_api_key, true)).?;
     defer credential.deinit(alloc);
@@ -771,8 +771,8 @@ test "openai credential loads profile key for preferred source when env unset" {
 
 test "remembered openai choice resolves profile key before fx login" {
     const alloc = std.testing.allocator;
-    openai_transport.configureProfileApiKey("profile-openai-key");
-    defer openai_transport.configureProfileApiKey(null);
+    try std.testing.expect(openai_transport.configureProfileApiKey("profile-openai-key"));
+    defer _ = openai_transport.configureProfileApiKey(null);
 
     const env = try CredentialTestEnv.install(alloc, &.{
         .{ "AI_GATEWAY_API_KEY", "api-key" },

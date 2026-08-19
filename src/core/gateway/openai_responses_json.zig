@@ -184,7 +184,7 @@ test "buildResponsesBody maps tool history to function_call items" {
     const messages = [_]ChatMessage{
         .{ .role = .user, .content = "read" },
         .{ .role = .assistant, .tool_calls = assistant_calls[0..] },
-        .{ .role = .tool, .tool_call_id = "call_1", .content = "file contents" },
+        .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "file contents" },
     };
     const body = try buildResponsesBody(alloc, "gpt-5", "[]", &messages, .auto, null, null, null);
     defer alloc.free(body);
@@ -206,7 +206,8 @@ test "buildResponsesBody commas separate assistant text and parallel tool calls"
             .content = "I'll inspect the repo.",
             .tool_calls = assistant_calls[0..],
         },
-        .{ .role = .tool, .tool_call_id = "call_1", .content = "contents" },
+        .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
+        .{ .role = .tool, .tool_call_id = "call_2", .tool_name = "list_files", .content = "listing" },
     };
     const body = try buildResponsesBody(alloc, "gpt-5", "[]", &messages, .auto, null, null, null);
     defer alloc.free(body);
@@ -214,11 +215,12 @@ test "buildResponsesBody commas separate assistant text and parallel tool calls"
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     const input = parsed.value.object.get("input").?.array;
-    try std.testing.expectEqual(@as(usize, 5), input.items.len);
+    try std.testing.expectEqual(@as(usize, 6), input.items.len);
     try std.testing.expectEqualStrings("message", input.items[1].object.get("type").?.string);
     try std.testing.expectEqualStrings("function_call", input.items[2].object.get("type").?.string);
     try std.testing.expectEqualStrings("function_call", input.items[3].object.get("type").?.string);
     try std.testing.expectEqualStrings("function_call_output", input.items[4].object.get("type").?.string);
+    try std.testing.expectEqualStrings("function_call_output", input.items[5].object.get("type").?.string);
 }
 
 test "buildResponsesBody rejects vision attachments" {

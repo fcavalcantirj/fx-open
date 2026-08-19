@@ -2648,6 +2648,7 @@ fn processQueuedPromptLoop(
                     .max_output_tokens = request_max_output_tokens(request_capabilities),
                     .budget = .{ .cancel_flag = config.cancel_flag },
                     .chat_url = config.gateway_chat_url,
+                    .wire_kind = config.gateway_wire_kind,
                 },
             ) catch |err| {
                 if (err == error.Cancelled) {
@@ -2717,6 +2718,7 @@ fn processQueuedPromptLoop(
                 gateway_model,
                 config.gateway_retry_count,
                 config.gateway_chat_url,
+                config.gateway_wire_kind,
                 request_payload,
                 deps.cooperative_transport_pulse,
                 &gateway_delivery,

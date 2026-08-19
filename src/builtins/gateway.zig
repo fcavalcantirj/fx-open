@@ -150,11 +150,10 @@ pub fn buildAgentRequest(
     alloc: Allocator,
     request: agent_stream_provider_contract.BuildRequest,
 ) anyerror![]u8 {
-    if (openai_transport.isOpenAiResponsesUrl(request.chat_url)) {
-        return buildOpenAiResponsesAgentRequest(alloc, request);
-    }
-    if (openai_transport.isOpenAiChatUrl(request.chat_url)) {
-        return buildOpenAiAgentRequest(alloc, request);
+    switch (request.wire_kind) {
+        .openai_responses => return buildOpenAiResponsesAgentRequest(alloc, request),
+        .openai_chat => return buildOpenAiAgentRequest(alloc, request),
+        .gateway => {},
     }
     const budget: ?gateway_json.BuildBudget = if (request.budget) |value|
         .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
@@ -293,6 +292,59 @@ fn writeVisionGatewaySchema(
     errdefer out.deinit();
     try gateway_schema.writeBuiltinFunctionSchema(alloc, &out.writer, vision_tool.gateway_schema);
     return out.toOwnedSlice();
+}
+
+test "agent request builder dispatches on wire kind not URL suffix" {
+    const alloc = std.testing.allocator;
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    const openai_like_url = "https://example.invalid/v1/chat/completions";
+    const neutral_url = "https://example.invalid/custom-endpoint";
+
+    const chat_body = try agent_stream_provider.build(alloc, .{
+        .model = "gpt-4o",
+        .serialized_tools = "[]",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = model_capabilities.resolveProviderOptions("gpt-4o", .auto, false),
+        .chat_url = neutral_url,
+        .wire_kind = .openai_chat,
+    });
+    defer alloc.free(chat_body);
+    try std.testing.expect(std.mem.find(u8, chat_body, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.find(u8, chat_body, "maxOutputTokens") == null);
+
+    const gateway_body = try agent_stream_provider.build(alloc, .{
+        .model = "anthropic/claude-opus-4.8",
+        .serialized_tools = "[]",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = model_capabilities.resolveProviderOptions(
+            "anthropic/claude-opus-4.8",
+            .auto,
+            false,
+        ),
+        .max_output_tokens = 32_000,
+        .chat_url = openai_like_url,
+        .wire_kind = .gateway,
+    });
+    defer alloc.free(gateway_body);
+    try std.testing.expect(std.mem.find(u8, gateway_body, "\"maxOutputTokens\":32000") != null);
+    try std.testing.expect(std.mem.find(u8, gateway_body, "\"max_tokens\"") == null);
+
+    const responses_body = try agent_stream_provider.build(alloc, .{
+        .model = "gpt-5",
+        .serialized_tools = "[]",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = model_capabilities.resolveProviderOptions("gpt-5", .auto, false),
+        .max_output_tokens = 8192,
+        .chat_url = openai_like_url,
+        .wire_kind = .openai_responses,
+    });
+    defer alloc.free(responses_body);
+    try std.testing.expect(std.mem.find(u8, responses_body, "\"input\":[") != null);
+    try std.testing.expect(std.mem.find(u8, responses_body, "\"max_output_tokens\":8192") != null);
+    try std.testing.expect(std.mem.find(u8, responses_body, "\"messages\":[") == null);
 }
 
 test "agent request builder keeps default reasoning silent and emits output limit" {
@@ -490,11 +542,10 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
-    if (openai_transport.isOpenAiResponsesUrl(request.chat_url)) {
-        return streamOpenAiResponsesAgentCompletion(alloc, request);
-    }
-    if (openai_transport.isOpenAiChatUrl(request.chat_url)) {
-        return streamOpenAiAgentCompletion(alloc, request);
+    switch (request.wire_kind) {
+        .openai_responses => return streamOpenAiResponsesAgentCompletion(alloc, request),
+        .openai_chat => return streamOpenAiAgentCompletion(alloc, request),
+        .gateway => {},
     }
     const result = gateway_client.streamGatewayCompletion(
         alloc,
@@ -857,7 +908,7 @@ fn executeWebSearchProvider(
     on_progress: ?ProgressFn,
     progress_ctx: ?*anyopaque,
 ) !Response {
-    if (openai_transport.isOpenAiWireUrl(inputs.gateway_chat_url)) {
+    if (inputs.gateway_wire_kind != .gateway) {
         const message = try alloc.dupe(u8, "Gateway web search is unavailable in OpenAI-compatible mode.");
         const content = try alloc.alloc(web_search_contract.ResultItem, 1);
         content[0] = .{ .error_text = message };

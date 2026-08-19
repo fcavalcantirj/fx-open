@@ -13,6 +13,7 @@ const config_runtime = @import("../config/config_runtime.zig");
 const devbox_executor = @import("../execution/devbox_executor.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
@@ -167,6 +168,7 @@ pub const Config = struct {
     models_path: []const u8,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
+    gateway_wire_kind: openai_transport.WireKind = .gateway,
     gateway_provider: gateway_provider.Provider,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
@@ -2656,6 +2658,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .default_agent_step_limit = cfg.default_agent_step_limit,
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
+        .gateway_wire_kind = cfg.gateway_wire_kind,
         .gateway_models_path = cfg.models_path,
         .gateway_provider = cfg.gateway_provider,
         .background_process_provider = cfg.background_process_provider,

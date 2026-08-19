@@ -637,6 +637,10 @@ pub const Runtime = struct {
         );
     }
 
+    pub fn gatewayWireKind(self: *const Self) openai_transport.WireKind {
+        return self.transport_route.wire_kind;
+    }
+
     fn refreshTransportRoute(self: *Self, alloc: Allocator) !void {
         self.transport_route.deinit(alloc);
         self.transport_route = try openai_transport.buildTransportRoute(alloc, self.credentialSource());
@@ -1548,7 +1552,7 @@ test "auth runtime rebuilds transport route when credential changes" {
     var gateway = try makeTestCredential(alloc, "gw-key", .ai_gateway_api_key, null, null);
     defer gateway.deinit(alloc);
     _ = runtime.adoptCredential(alloc, &gateway);
-    try std.testing.expect(!runtime.transport_route.uses_openai_wire);
+    try std.testing.expectEqual(openai_transport.WireKind.gateway, runtime.transport_route.wire_kind);
     try std.testing.expectEqualStrings(
         "https://ai-gateway.vercel.sh/v3/ai/language-model",
         runtime.gatewayChatUrl("https://ai-gateway.vercel.sh/v3/ai/language-model"),
@@ -1556,8 +1560,10 @@ test "auth runtime rebuilds transport route when credential changes" {
 
     var openai = try makeTestCredential(alloc, "oa-key", .openai_api_key, null, null);
     defer openai.deinit(alloc);
+    openai_transport.configureProfileApiStyle("chat");
+    defer openai_transport.configureProfileApiStyle(null);
     _ = runtime.adoptCredential(alloc, &openai);
-    try std.testing.expect(runtime.transport_route.uses_openai_wire);
+    try std.testing.expectEqual(openai_transport.WireKind.openai_chat, runtime.transport_route.wire_kind);
     try std.testing.expect(std.mem.endsWith(
         u8,
         runtime.gatewayChatUrl("https://ai-gateway.vercel.sh/v3/ai/language-model"),
