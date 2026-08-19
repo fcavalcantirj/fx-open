@@ -87,20 +87,16 @@ pub fn buildTransportRoute(
 
     const base = resolveOpenAiBaseUrl();
     const style = resolveOpenAiApiStyle();
-    const wire_url = formatWireUrl(alloc, base, style) catch |err| switch (err) {
-        error.OpenAiWireUrlTooLong => try alloc.dupe(u8, ""),
-        else => return err,
-    };
+    const wire_url = try formatWireUrl(alloc, base, style);
     errdefer alloc.free(wire_url);
     const models_url = try formatModelsUrl(alloc, base);
     errdefer alloc.free(models_url);
-    const wire_kind: WireKind = if (wire_url.len == 0) .gateway else switch (style) {
-        .chat => .openai_chat,
-        .responses => .openai_responses,
-    };
 
     return .{
-        .wire_kind = wire_kind,
+        .wire_kind = switch (style) {
+            .chat => .openai_chat,
+            .responses => .openai_responses,
+        },
         .wire_url = wire_url,
         .models_url = models_url,
     };
@@ -354,4 +350,42 @@ test "formatModelsUrl composes OpenAI models endpoint" {
     const url = try formatModelsUrl(alloc, "https://api.openai.com/v1");
     defer alloc.free(url);
     try std.testing.expectEqualStrings("https://api.openai.com/v1/models", url);
+}
+
+var stable_openai_transport_test_environ: ?*std.process.Environ.Map = null;
+
+fn stableOpenAiTransportTestEnviron() !*const std.process.Environ.Map {
+    if (stable_openai_transport_test_environ) |map| return map;
+
+    const alloc = std.heap.page_allocator;
+    const map = try alloc.create(std.process.Environ.Map);
+    map.* = std.process.Environ.Map.init(alloc);
+    stable_openai_transport_test_environ = map;
+    return map;
+}
+
+test "formatWireUrl fails for oversized custom OpenAI base URL" {
+    const alloc = std.testing.allocator;
+    var long_host: [1000]u8 = undefined;
+    @memset(&long_host, 'a');
+    const oversized = try std.fmt.allocPrint(alloc, "https://{s}/v1", .{long_host[0..]});
+    defer alloc.free(oversized);
+    try std.testing.expectError(error.OpenAiWireUrlTooLong, formatWireUrl(alloc, oversized, .chat));
+}
+
+test "buildTransportRoute fails closed on oversized OpenAI base URL" {
+    const alloc = std.testing.allocator;
+    var long_host: [1000]u8 = undefined;
+    @memset(&long_host, 'a');
+    const oversized = try std.fmt.allocPrint(alloc, "https://{s}/v1", .{long_host[0..]});
+    defer alloc.free(oversized);
+
+    var map = std.process.Environ.Map.init(alloc);
+    defer map.deinit();
+    try map.put(openai_base_url_env, oversized);
+    const stable = try stableOpenAiTransportTestEnviron();
+    io_mod.setEnvironMap(&map);
+    defer io_mod.setEnvironMap(stable);
+
+    try std.testing.expectError(error.OpenAiWireUrlTooLong, buildTransportRoute(alloc, .openai_api_key));
 }

@@ -291,7 +291,7 @@ pub fn loadSource(
     return switch (source) {
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
-        .openai_api_key => loadOpenAiApiKeyCredential(alloc, source),
+        .openai_api_key => loadOpenAiApiKeyCredentialWithProfile(alloc, source, true),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
     };
@@ -349,6 +349,7 @@ fn loadOpenAiApiKeyCredentialWithProfile(
     source: Source,
     include_profile: bool,
 ) !?Credential {
+    // OpenAI key precedence: OPENAI_API_KEY, LITELLM_API_KEY, profile openai_api_key.
     if (try loadEnvCredential(alloc, "OPENAI_API_KEY", source)) |credential| return credential;
     if (try loadEnvCredential(alloc, "LITELLM_API_KEY", source)) |credential| return credential;
     if (!include_profile) return null;
@@ -767,6 +768,17 @@ test "openai credential loads profile key for preferred source when env unset" {
     try std.testing.expectEqualStrings("profile-openai-key", credential.token);
     try std.testing.expectEqual(Source.openai_api_key, credential.source);
     try std.testing.expect((try loadOpenAiApiKeyCredential(alloc, .openai_api_key)) == null);
+}
+
+test "loadSource resolves profile openai key when env unset" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(openai_transport.configureProfileApiKey("profile-openai-key"));
+    defer _ = openai_transport.configureProfileApiKey(null);
+
+    var credential = (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .openai_api_key)).?;
+    defer credential.deinit(alloc);
+    try std.testing.expectEqualStrings("profile-openai-key", credential.token);
+    try std.testing.expectEqual(Source.openai_api_key, credential.source);
 }
 
 test "remembered openai choice resolves profile key before fx login" {

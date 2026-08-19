@@ -210,7 +210,7 @@ pub fn Runtime(comptime App: type) type {
             if (startup.takeCredential()) |credential_value| {
                 var credential = credential_value;
                 defer credential.deinit(app.alloc);
-                _ = app.auth.adoptCredential(app.alloc, &credential);
+                _ = try app.auth.adoptCredential(app.alloc, &credential);
             }
             app.auth.recordStartupStatus(
                 startup.stored_key_status,

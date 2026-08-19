@@ -434,7 +434,7 @@ fn loadStartupStateFromOwnedWorkspace(
             }
         }
         if (state.credential) |credential| {
-            state.transport_route = openai_transport.buildTransportRoute(alloc, credential.source) catch .{};
+            state.transport_route = try openai_transport.buildTransportRoute(alloc, credential.source);
         }
         state.stored_key_status = resolution.stored_key_status;
     }

@@ -158,6 +158,24 @@ const StreamedToolCall = struct {
     }
 };
 
+fn dupeStreamedToolCall(alloc: Allocator, tool: StreamedToolCall) !types.ToolCall {
+    const args = if (tool.arguments.items.len == 0) "{}" else tool.arguments.items;
+    if (try types.ToolArgumentIntegrity.classifySerialized(alloc, args) == .malformed_json) {
+        return error.InvalidGatewayResponse;
+    }
+    const id = try alloc.dupe(u8, tool.id.items);
+    errdefer alloc.free(id);
+    const name = try alloc.dupe(u8, tool.name.items);
+    errdefer alloc.free(name);
+    const arguments_json = try alloc.dupe(u8, args);
+    errdefer alloc.free(arguments_json);
+    return .{
+        .id = id,
+        .name = name,
+        .arguments_json = arguments_json,
+    };
+}
+
 pub fn streamOpenAiResponsesCompletion(
     alloc: Allocator,
     request: StreamRequest,
@@ -350,15 +368,7 @@ fn consumeResponsesSseStream(
         }
         for (streamed_tools.items) |tool| {
             if (tool.id.items.len == 0 or tool.name.items.len == 0) continue;
-            const args = if (tool.arguments.items.len == 0) "{}" else tool.arguments.items;
-            if (try types.ToolArgumentIntegrity.classifySerialized(alloc, args) == .malformed_json) {
-                return error.InvalidGatewayResponse;
-            }
-            buffer[count] = .{
-                .id = try alloc.dupe(u8, tool.id.items),
-                .name = try alloc.dupe(u8, tool.name.items),
-                .arguments_json = try alloc.dupe(u8, args),
-            };
+            buffer[count] = try dupeStreamedToolCall(alloc, tool);
             count += 1;
         }
         if (count > 0) {

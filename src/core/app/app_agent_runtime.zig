@@ -1470,7 +1470,7 @@ const FakeApp = struct {
             .source = .ai_gateway_api_key,
         };
         defer credential.deinit(alloc);
-        _ = app.auth.adoptCredential(alloc, &credential);
+        _ = try app.auth.adoptCredential(alloc, &credential);
         errdefer app.auth.deinit(alloc);
         try app.selected_model.appendSlice(alloc, "test-model");
         return app;
