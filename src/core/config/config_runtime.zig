@@ -41,6 +41,7 @@ pub const Settings = struct {
     model: ?[]u8 = null,
     provider: ?model_provider.ProviderId = null,
     codex_model: ?[]u8 = null,
+    openai_model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
@@ -75,6 +76,7 @@ pub const Settings = struct {
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
         if (self.codex_model) |value| alloc.free(value);
+        if (self.openai_model) |value| alloc.free(value);
         if (self.input_appearance) |value| alloc.free(value);
         if (self.maxxing_mode) |value| alloc.free(value);
         if (self.sandbox) |value| alloc.free(value);
@@ -118,6 +120,7 @@ pub const ConfigSources = struct {
     model: ConfigSource = .compiled_default,
     provider: ConfigSource = .compiled_default,
     codex_model: ConfigSource = .compiled_default,
+    openai_model: ConfigSource = .compiled_default,
     permission_mode: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
@@ -557,6 +560,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "model",
         "provider",
         "codex_model",
+        "openai_model",
         "effort",
         "fast_mode",
         "input_appearance",
@@ -606,6 +610,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.model != null) sources.model = source;
     if (settings.provider != null) sources.provider = source;
     if (settings.codex_model != null) sources.codex_model = source;
+    if (settings.openai_model != null) sources.openai_model = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
@@ -1359,6 +1364,12 @@ fn parseProfileOnlyFields(
         settings.codex_model = try alloc.dupe(u8, model_value.string);
     }
 
+    if (root.object.get("openai_model")) |model_value| {
+        if (model_value != .string) return error.InvalidOpenAiModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidOpenAiModelValue;
+        settings.openai_model = try alloc.dupe(u8, model_value.string);
+    }
+
     if (root.object.get("permission_mode")) |permission_mode_value| {
         const value = permission_mode_value;
         if (value != .string) return error.InvalidPermissionModeType;
@@ -1571,6 +1582,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         if (target.codex_model) |current| alloc.free(current);
         target.codex_model = value;
         incoming.codex_model = null;
+    }
+    if (incoming.openai_model) |value| {
+        if (target.openai_model) |current| alloc.free(current);
+        target.openai_model = value;
+        incoming.openai_model = null;
     }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;

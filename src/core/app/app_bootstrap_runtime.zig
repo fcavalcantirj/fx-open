@@ -8,7 +8,6 @@ const app_runtime_setup = @import("app_runtime_setup.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
-const openai_transport = @import("../gateway/openai_transport.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
 const host = @import("../hosts/host.zig");
@@ -272,6 +271,9 @@ pub fn Runtime(comptime App: type) type {
                 app.provider_selection.adoptOwned(startup.provider, &selected_model);
             } else {
                 try provider_runtime.replaceModel(app, selected_model);
+            }
+            if (comptime @hasDecl(App, "refreshOpenAiConfig")) {
+                try app.refreshOpenAiConfig(startup.takeOpenAiBaseUrl(), startup.openai_api_style);
             }
             const active_model = provider_runtime.model(app);
             try deps.configure_session_preferences(

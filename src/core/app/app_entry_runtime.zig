@@ -51,6 +51,8 @@ pub const Config = struct {
     codex_agent_stream: ?agent_stream_provider.Provider = null,
     codex_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     codex_model_catalog: ?model_catalog.Provider = null,
+    openai_agent_stream: ?agent_stream_provider.Provider = null,
+    openai_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -402,6 +404,8 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .codex_agent_stream = cfg.codex_agent_stream,
         .codex_cli_model_catalog = cfg.codex_cli_model_catalog,
         .codex_model_catalog = cfg.codex_model_catalog,
+        .openai_agent_stream = cfg.openai_agent_stream,
+        .openai_model_catalog = cfg.openai_model_catalog,
         .background_process_provider = cfg.background_process_provider,
         .url_opener = cfg.url_opener,
         .secret_store = cfg.secret_store,

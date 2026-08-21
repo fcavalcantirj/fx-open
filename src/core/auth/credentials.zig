@@ -8,6 +8,7 @@ const model_provider = @import("../config/model_provider.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
 
@@ -40,6 +41,7 @@ pub const CatalogAuthenticatedSource = enum {
     fx_login,
     stored_key,
     chatgpt_subscription,
+    openai_api_key,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -48,6 +50,7 @@ pub const CatalogAuthenticatedSource = enum {
             .fx_login => .fx_login,
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
+            .openai_api_key => .openai_api_key,
         };
     }
 };
@@ -143,6 +146,7 @@ pub fn catalogAccessForCredential(
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
         .chatgpt_subscription => .chatgpt_subscription,
+        .openai_api_key => .openai_api_key,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -172,9 +176,28 @@ const FxLoginRefreshMode = enum { if_needed, force };
 
 pub const missing_credential_message = "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "Fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_openai_credential_message = "Fx needs an OpenAI-compatible API key. Set OPENAI_API_KEY, LITELLM_API_KEY, or openai_api_key in ~/.fx/settings.json.";
+pub const missing_openai_interactive_credential_message = "Fx needs an OpenAI-compatible API key. Set OPENAI_API_KEY, LITELLM_API_KEY, or openai_api_key in ~/.fx/settings.json.";
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login and choose Sign in with Codex.";
 pub const unreadable_store_message = "Fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
+
+pub fn missingCredentialMessage(provider: model_provider.ProviderId, interactive: bool) []const u8 {
+    return switch (provider) {
+        .codex => if (interactive)
+            missing_chatgpt_interactive_credential_message
+        else
+            missing_chatgpt_credential_message,
+        .openai => if (interactive)
+            missing_openai_interactive_credential_message
+        else
+            missing_openai_credential_message,
+        .gateway => if (interactive)
+            missing_interactive_credential_message
+        else
+            missing_credential_message,
+    };
+}
 
 pub const Credential = struct {
     token: []u8,
@@ -247,6 +270,7 @@ pub fn resolveForProvider(
     mode: LoadMode,
     provider: model_provider.ProviderId,
     preferred: ?Source,
+    profile_openai_api_key: ?[]const u8,
 ) !Resolution {
     if (provider == .codex) {
         const credential = switch (mode) {
@@ -254,6 +278,9 @@ pub fn resolveForProvider(
             .refresh_if_needed => try loadChatGptCredential(alloc, transport, .if_needed),
         };
         return .{ .credential = credential };
+    }
+    if (provider == .openai) {
+        return .{ .credential = try loadOpenAiApiKeyCredential(alloc, profile_openai_api_key) };
     }
     return resolvePreferring(
         alloc,
@@ -356,12 +383,23 @@ pub fn loadSource(
     secret_store: host.SecretStore,
     source: Source,
 ) !?Credential {
+    return loadSourceWithProfile(alloc, transport, secret_store, source, null);
+}
+
+pub fn loadSourceWithProfile(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    source: Source,
+    profile_openai_api_key: ?[]const u8,
+) !?Credential {
     return switch (source) {
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
+        .openai_api_key => loadOpenAiApiKeyCredential(alloc, profile_openai_api_key),
     };
 }
 
@@ -369,6 +407,15 @@ pub fn sourceExists(
     alloc: std.mem.Allocator,
     secret_store: host.SecretStore,
     source: Source,
+) !bool {
+    return sourceExistsWithProfile(alloc, secret_store, source, null);
+}
+
+pub fn sourceExistsWithProfile(
+    alloc: std.mem.Allocator,
+    secret_store: host.SecretStore,
+    source: Source,
+    profile_openai_api_key: ?[]const u8,
 ) !bool {
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
@@ -386,6 +433,7 @@ pub fn sourceExists(
             break :blk true;
         },
         .chatgpt_subscription => chatgpt_oauth.sourceExists(alloc),
+        .openai_api_key => openai_transport.openAiApiKeyConfigured(.{ .openai_api_key = profile_openai_api_key }),
         .stored_key => blk: {
             if (secret_store.isDisabled()) break :blk false;
             const stored = secret_store.load(alloc) catch |err| switch (err) {
@@ -412,6 +460,37 @@ fn loadEnvCredential(
         .token = try alloc.dupe(u8, value),
         .source = source,
     };
+}
+
+pub fn openAiApiKeyConfigured(profile_openai_api_key: ?[]const u8) bool {
+    return openai_transport.openAiApiKeyConfigured(.{
+        .openai_api_key = profile_openai_api_key,
+    });
+}
+
+fn loadOpenAiApiKeyCredential(alloc: std.mem.Allocator, profile_key: ?[]const u8) !?Credential {
+    if (nonEmptyEnvValue(openai_transport.openai_api_key_env)) |value| {
+        return .{
+            .token = try alloc.dupe(u8, value),
+            .source = .openai_api_key,
+        };
+    }
+    if (nonEmptyEnvValue(openai_transport.litellm_api_key_env)) |value| {
+        return .{
+            .token = try alloc.dupe(u8, value),
+            .source = .openai_api_key,
+        };
+    }
+    if (profile_key) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len > 0) {
+            return .{
+                .token = try alloc.dupe(u8, trimmed),
+                .source = .openai_api_key,
+            };
+        }
+    }
+    return null;
 }
 
 fn loadStoredKeyCredential(
@@ -581,6 +660,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
+        .openai_api_key => "OpenAI API key",
     };
 }
 
@@ -1056,4 +1136,41 @@ test "a disabled store still reports why the fx login was silent" {
     try std.testing.expect(resolution.credential == null);
     try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
     try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
+}
+
+test "resolveForProvider openai never returns a gateway credential" {
+    const alloc = std.testing.allocator;
+    var env = try CredentialTestEnv.install(alloc, &.{.{ "OPENAI_API_KEY", "sk-test-openai" }});
+    defer env.deinit();
+
+    var resolution = try resolveForProvider(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        .refresh_if_needed,
+        .openai,
+        null,
+        null,
+    );
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+
+    const credential = resolution.credential orelse return error.TestExpectedCredential;
+    try std.testing.expectEqual(Source.openai_api_key, credential.source);
+    try std.testing.expect(!model_provider.authorizesCredential(.gateway, credential.source));
+}
+
+test "sourceExistsWithProfile honors profile openai_api_key" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try sourceExistsWithProfile(
+        alloc,
+        host.unavailable_secret_store,
+        .openai_api_key,
+        "profile-key",
+    ));
+    try std.testing.expect(!(try sourceExistsWithProfile(
+        alloc,
+        host.unavailable_secret_store,
+        .openai_api_key,
+        null,
+    )));
 }

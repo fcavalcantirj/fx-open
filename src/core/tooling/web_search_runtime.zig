@@ -40,7 +40,6 @@ pub const Config = struct {
     worker_model: []const u8 = "",
     gateway_retry_count: usize = 3,
     gateway_chat_url: []const u8 = "https://ai-gateway.vercel.sh/v3/ai/language-model",
-    gateway_wire_kind: openai_transport.WireKind = .gateway,
     usage: ?*session_usage.Usage = null,
     usage_allocator: Allocator = std.heap.c_allocator,
 };
@@ -53,7 +52,6 @@ const OwnedInputs = struct {
     worker_model: []u8,
     gateway_retry_count: usize,
     gateway_chat_url: []u8,
-    gateway_wire_kind: openai_transport.WireKind = .gateway,
     // The usage pointer and allocator borrow the parent session's lifetime.
     usage: ?*session_usage.Usage,
     usage_allocator: Allocator,
@@ -73,7 +71,6 @@ const OwnedInputs = struct {
             .worker_model = self.worker_model,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = self.gateway_chat_url,
-            .gateway_wire_kind = self.gateway_wire_kind,
             .usage = self.usage,
             .usage_allocator = self.usage_allocator,
         };
@@ -91,7 +88,6 @@ pub const Runtime = struct {
     worker_model: []const u8,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
-    gateway_wire_kind: openai_transport.WireKind = .gateway,
     usage: ?*session_usage.Usage,
     usage_allocator: Allocator,
     config_mutex: std.Io.Mutex = .init,
@@ -107,7 +103,6 @@ pub const Runtime = struct {
             .worker_model = config.worker_model,
             .gateway_retry_count = config.gateway_retry_count,
             .gateway_chat_url = config.gateway_chat_url,
-            .gateway_wire_kind = config.gateway_wire_kind,
             .usage = config.usage,
             .usage_allocator = config.usage_allocator,
         };
@@ -123,7 +118,6 @@ pub const Runtime = struct {
         self.worker_model = inputs.worker_model;
         self.gateway_retry_count = inputs.gateway_retry_count;
         self.gateway_chat_url = inputs.gateway_chat_url;
-        self.gateway_wire_kind = inputs.gateway_wire_kind;
         self.usage = inputs.usage;
         self.usage_allocator = inputs.usage_allocator;
     }
@@ -236,7 +230,6 @@ pub const Runtime = struct {
             .worker_model = worker_model,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = gateway_chat_url,
-            .gateway_wire_kind = self.gateway_wire_kind,
             .usage = self.usage,
             .usage_allocator = self.usage_allocator,
         };

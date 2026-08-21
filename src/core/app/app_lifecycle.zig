@@ -6,6 +6,8 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
+const openai_compatible = @import("../../gateway/openai_compatible.zig");
 const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -154,6 +156,26 @@ pub const StartupState = struct {
     notification_attention_required: bool = false,
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
+    openai_base_url: []u8 = &.{},
+    openai_api_style: openai_transport.ApiStyle = .chat,
+    profile_openai_api_key: []u8 = &.{},
+
+    pub fn profileOpenAiApiKey(self: *const StartupState) ?[]const u8 {
+        return if (self.profile_openai_api_key.len > 0) self.profile_openai_api_key else null;
+    }
+
+    pub fn takeProfileOpenAiApiKey(self: *StartupState) []u8 {
+        const value = self.profile_openai_api_key;
+        self.profile_openai_api_key = &.{};
+        return value;
+    }
+
+    pub fn openAiCompatibleConfig(self: *const StartupState) openai_compatible.OpenAiCompatibleConfig {
+        return .{
+            .base_url = if (self.openai_base_url.len > 0) self.openai_base_url else openai_transport.default_base_url,
+            .api_style = self.openai_api_style,
+        };
+    }
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
         self.workspace_access.deinit(alloc);
@@ -161,6 +183,8 @@ pub const StartupState = struct {
         if (self.credential) |*credential| credential.deinit(alloc);
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
+        if (self.openai_base_url.len > 0) alloc.free(self.openai_base_url);
+        if (self.profile_openai_api_key.len > 0) alloc.free(self.profile_openai_api_key);
         self.permission_rules.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
@@ -206,6 +230,12 @@ pub const StartupState = struct {
     pub fn takeSelectedModel(self: *StartupState) []u8 {
         const value = self.selected_model;
         self.selected_model = &.{};
+        return value;
+    }
+
+    pub fn takeOpenAiBaseUrl(self: *StartupState) []u8 {
+        const value = self.openai_base_url;
+        self.openai_base_url = &.{};
         return value;
     }
 
@@ -330,6 +360,7 @@ pub fn loadStartupStatus(
         secret_store,
         configured_selection.provider,
         settings.credential_source,
+        settings.openai_api_key,
     );
     errdefer auth_status.deinit(alloc);
 
@@ -401,12 +432,32 @@ fn loadStartupStateFromOwnedWorkspace(
         false,
     );
 
-    const configured_selection = try configuredProviderSelection(default_model, settings);
+    const configured_selection = try resolveEffectiveProvider(
+        alloc,
+        transport,
+        secret_store,
+        default_model,
+        settings,
+        credential_mode,
+    );
     state.provider = configured_selection.provider;
     state.configured_model = try alloc.dupe(u8, configured_selection.model);
     state.model_source = detailed.model_source orelse .compiled_default;
     state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);
     if (hasProcessModelOverride()) state.model_source = .process_override;
+    state.openai_base_url = try alloc.dupe(u8, openai_transport.resolveOpenAiBaseUrlFromSettings(.{
+        .openai_base_url = settings.openai_base_url,
+        .openai_api_key = settings.openai_api_key,
+        .openai_api_style = settings.openai_api_style,
+    }));
+    state.openai_api_style = openai_transport.resolveOpenAiApiStyleFromSettings(.{
+        .openai_base_url = settings.openai_base_url,
+        .openai_api_key = settings.openai_api_key,
+        .openai_api_style = settings.openai_api_style,
+    });
+    if (settings.openai_api_key) |profile_key| {
+        state.profile_openai_api_key = try alloc.dupe(u8, profile_key);
+    }
     state.config_diagnostics = detailed.diagnostics;
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
@@ -419,6 +470,7 @@ fn loadStartupStateFromOwnedWorkspace(
             mode,
             state.provider,
             settings.credential_source,
+            settings.openai_api_key,
         );
         state.credential = resolution.credential;
         state.stored_key_status = resolution.stored_key_status;
@@ -1118,12 +1170,55 @@ fn configuredProviderSelection(
     default_model: []const u8,
     settings: *const config_runtime.Settings,
 ) !model_provider.ProviderSelection {
-    const provider = settings.provider orelse .gateway;
+    const provider = blk: {
+        if (io_mod.getenv("FX_PROVIDER")) |raw| {
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            if (trimmed.len > 0) {
+                if (model_provider.parse(trimmed)) |parsed| break :blk parsed;
+            }
+        }
+        break :blk settings.provider orelse .gateway;
+    };
     const model = switch (provider) {
         .gateway => settings.model orelse default_model,
         .codex => settings.codex_model orelse return error.CodexModelNotSelected,
+        .openai => settings.openai_model orelse return error.OpenAiModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
+}
+
+fn resolveEffectiveProvider(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    settings: *const config_runtime.Settings,
+    credential_mode: ?CredentialLoadMode,
+) !model_provider.ProviderSelection {
+    const configured = try configuredProviderSelection(default_model, settings);
+    if (configured.provider != .gateway) return configured;
+    if (credential_mode == null) return configured;
+
+    const preferred = if (settings.credential_source == .chatgpt_subscription)
+        null
+    else
+        settings.credential_source;
+    const gateway_resolution = try credentials.resolvePreferring(
+        alloc,
+        transport,
+        secret_store,
+        credential_mode.?,
+        preferred,
+    );
+    if (gateway_resolution.credential) |credential| {
+        var owned = credential;
+        owned.deinit(alloc);
+        return configured;
+    }
+
+    if (!credentials.openAiApiKeyConfigured(settings.openai_api_key)) return configured;
+    const model = settings.openai_model orelse configured.model;
+    return .{ .provider = .openai, .model = model };
 }
 
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
@@ -1156,6 +1251,37 @@ test "startup provider chooses only its provider-scoped model" {
         error.CodexModelNotSelected,
         configuredProviderSelection("default/model", &missing_codex),
     );
+
+    const openai_settings = config_runtime.Settings{
+        .model = @constCast("gateway/model"),
+        .provider = .openai,
+        .openai_model = @constCast("gpt-4o"),
+    };
+    const openai = try configuredProviderSelection("default/model", &openai_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.openai, openai.provider);
+    try std.testing.expectEqualStrings("gpt-4o", openai.model);
+
+    const missing_openai = config_runtime.Settings{ .provider = .openai };
+    try std.testing.expectError(
+        error.OpenAiModelNotSelected,
+        configuredProviderSelection("default/model", &missing_openai),
+    );
+}
+
+test "FX_PROVIDER overrides saved provider selection" {
+    var env = try TestEnv.install(std.testing.allocator, &.{
+        .{ .key = "FX_PROVIDER", .value = "openai" },
+    });
+    defer env.deinit();
+
+    const settings = config_runtime.Settings{
+        .provider = .gateway,
+        .model = @constCast("gateway/model"),
+        .openai_model = @constCast("gpt-4o"),
+    };
+    const selected = try configuredProviderSelection("default/model", &settings);
+    try std.testing.expectEqual(model_provider.ProviderId.openai, selected.provider);
+    try std.testing.expectEqualStrings("gpt-4o", selected.model);
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {

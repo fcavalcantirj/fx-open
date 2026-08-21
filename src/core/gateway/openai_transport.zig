@@ -1,10 +1,10 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
-const types = @import("../shared/types.zig");
 
 pub const gateway_chat_url_env = "FX_GATEWAY_CHAT_URL";
 
 pub const openai_api_key_env = "OPENAI_API_KEY";
+pub const litellm_api_key_env = "LITELLM_API_KEY";
 pub const openai_base_url_env = "FX_OPENAI_BASE_URL";
 pub const openai_api_style_env = "FX_OPENAI_API_STYLE";
 pub const default_base_url = "https://api.openai.com/v1";
@@ -15,12 +15,6 @@ pub const responses_suffix = "/responses";
 pub const e2e_openai_chat_url_env = "FX_E2E_OPENAI_CHAT_URL";
 pub const e2e_openai_responses_url_env = "FX_E2E_OPENAI_RESPONSES_URL";
 pub const e2e_openai_models_url_env = "FX_E2E_OPENAI_MODELS_URL";
-
-pub const WireKind = enum {
-    gateway,
-    openai_chat,
-    openai_responses,
-};
 
 pub const ApiStyle = enum {
     chat,
@@ -40,9 +34,11 @@ pub const ApiStyle = enum {
     }
 };
 
-pub fn isOpenAiCredentialSource(source: types.CredentialSource) bool {
-    return source == .openai_api_key;
-}
+pub const OpenAiSettings = struct {
+    openai_base_url: ?[]const u8 = null,
+    openai_api_style: ?[]const u8 = null,
+    openai_api_key: ?[]const u8 = null,
+};
 
 fn nonEmptyEnv(name: []const u8) ?[]const u8 {
     const raw = io_mod.getenv(name) orelse return null;
@@ -50,76 +46,34 @@ fn nonEmptyEnv(name: []const u8) ?[]const u8 {
     return raw;
 }
 
-pub fn resolveOpenAiBaseUrl() []const u8 {
+pub fn resolveOpenAiBaseUrlFromSettings(settings: OpenAiSettings) []const u8 {
     if (nonEmptyEnv(openai_base_url_env)) |value| return value;
-    if (profileBaseUrl()) |url| return url;
+    if (settings.openai_base_url) |url| {
+        if (std.mem.trim(u8, url, " \t\r\n").len > 0) return url;
+    }
     return default_base_url;
 }
 
-/// Immutable routing snapshot for one credential selection. Built when the
-/// credential changes and carried with each request so in-flight workers cannot
-/// observe a different transport mode than the credential they were started with.
-pub const TransportRoute = struct {
-    wire_kind: WireKind = .gateway,
-    wire_url: []u8 = "",
-    models_url: []u8 = "",
-
-    pub const gateway = TransportRoute{};
-
-    pub fn deinit(self: *TransportRoute, alloc: std.mem.Allocator) void {
-        if (self.wire_url.len > 0) alloc.free(self.wire_url);
-        if (self.models_url.len > 0) alloc.free(self.models_url);
-        self.* = .{};
+pub fn resolveOpenAiApiStyleFromSettings(settings: OpenAiSettings) ApiStyle {
+    if (nonEmptyEnv(openai_api_style_env)) |value| {
+        if (ApiStyle.parse(value)) |parsed| return parsed;
     }
-
-    pub fn chatUrl(self: TransportRoute, gateway_fallback: []const u8) []const u8 {
-        if (self.wire_kind != .gateway) return self.wire_url;
-        return gateway_fallback;
+    if (settings.openai_api_style) |style| {
+        const trimmed = std.mem.trim(u8, style, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (ApiStyle.parse(trimmed)) |parsed| return parsed;
+        }
     }
-};
-
-pub fn buildTransportRoute(
-    alloc: std.mem.Allocator,
-    source: ?types.CredentialSource,
-) !TransportRoute {
-    const selected = source orelse return .{};
-    if (!isOpenAiCredentialSource(selected)) return .{};
-
-    const base = resolveOpenAiBaseUrl();
-    const style = resolveOpenAiApiStyle();
-    const wire_url = try formatWireUrl(alloc, base, style);
-    errdefer alloc.free(wire_url);
-    const models_url = try formatModelsUrl(alloc, base);
-    errdefer alloc.free(models_url);
-
-    return .{
-        .wire_kind = switch (style) {
-            .chat => .openai_chat,
-            .responses => .openai_responses,
-        },
-        .wire_url = wire_url,
-        .models_url = models_url,
-    };
+    return .chat;
 }
 
-pub fn formatWireUrl(
-    alloc: std.mem.Allocator,
-    base_url: []const u8,
-    style: ApiStyle,
-) ![]u8 {
-    var buf: [1024]u8 = undefined;
-    const formatted = switch (style) {
-        .chat => formatChatUrl(&buf, base_url),
-        .responses => formatResponsesUrl(&buf, base_url),
-    } catch {
-        if (!std.mem.eql(u8, base_url, default_base_url)) return error.OpenAiWireUrlTooLong;
-        const suffix = switch (style) {
-            .chat => chat_completions_suffix,
-            .responses => responses_suffix,
-        };
-        return std.fmt.allocPrint(alloc, "{s}{s}", .{ default_base_url, suffix });
-    };
-    return try alloc.dupe(u8, formatted);
+pub fn openAiApiKeyConfigured(settings: OpenAiSettings) bool {
+    if (nonEmptyEnv(openai_api_key_env) != null) return true;
+    if (nonEmptyEnv(litellm_api_key_env) != null) return true;
+    if (settings.openai_api_key) |key| {
+        if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
+    }
+    return false;
 }
 
 pub fn resolveGatewayChatUrl(fallback: []const u8, override: ?[]const u8) []const u8 {
@@ -146,72 +100,41 @@ fn isLoopbackHttpUrl(url: []const u8) bool {
         std.mem.eql(u8, host, "[::1]");
 }
 
-var profile_base_url_storage: [512]u8 = undefined;
-var profile_base_url_len: usize = 0;
-var profile_openai_api_key_storage: [512]u8 = undefined;
-var profile_openai_api_key_len: usize = 0;
-var profile_api_style: ApiStyle = .chat;
-var profile_api_style_configured: bool = false;
-
-/// Returns false when a non-empty profile key exceeds the fixed storage cap.
-pub fn configureProfileApiKey(key: ?[]const u8) bool {
-    profile_openai_api_key_len = 0;
-    if (key) |value| {
-        const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        if (trimmed.len == 0) return true;
-        if (trimmed.len > profile_openai_api_key_storage.len) return false;
-        @memcpy(profile_openai_api_key_storage[0..trimmed.len], trimmed);
-        profile_openai_api_key_len = trimmed.len;
-    }
-    return true;
+pub fn resolveWireUrl(
+    buf: []u8,
+    base_url: []const u8,
+    style: ApiStyle,
+) ![]const u8 {
+    return switch (style) {
+        .chat => formatChatUrl(buf, base_url),
+        .responses => formatResponsesUrl(buf, base_url),
+    };
 }
 
-pub fn profileOpenAiApiKey() ?[]const u8 {
-    if (profile_openai_api_key_len == 0) return null;
-    return profile_openai_api_key_storage[0..profile_openai_api_key_len];
+pub fn selectE2eWireUrl(
+    e2e_env: ?[]const u8,
+    fallback: []const u8,
+) []const u8 {
+    const override = e2e_env orelse return fallback;
+    if (!isLoopbackHttpUrl(override)) return fallback;
+    return override;
 }
 
-pub fn profileOpenAiApiKeyPresent() bool {
-    return profileOpenAiApiKey() != null;
-}
-
-/// Returns false when a non-empty profile URL exceeds the fixed storage cap.
-pub fn configureProfileBaseUrl(url: ?[]const u8) bool {
-    profile_base_url_len = 0;
-    if (url) |value| {
-        const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        if (trimmed.len == 0) return true;
-        if (trimmed.len > profile_base_url_storage.len) return false;
-        @memcpy(profile_base_url_storage[0..trimmed.len], trimmed);
-        profile_base_url_len = trimmed.len;
-    }
-    return true;
-}
-
-pub fn configureProfileApiStyle(style: ?[]const u8) void {
-    profile_api_style = .chat;
-    profile_api_style_configured = false;
-    if (style) |value| {
-        const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        if (trimmed.len == 0) return;
-        if (ApiStyle.parse(trimmed)) |parsed| {
-            profile_api_style = parsed;
-            profile_api_style_configured = true;
-        }
-    }
-}
-
-pub fn resolveOpenAiApiStyle() ApiStyle {
-    if (nonEmptyEnv(openai_api_style_env)) |value| {
-        if (ApiStyle.parse(value)) |parsed| return parsed;
-    }
-    if (profile_api_style_configured) return profile_api_style;
-    return .chat;
-}
-
-fn profileBaseUrl() ?[]const u8 {
-    if (profile_base_url_len == 0) return null;
-    return profile_base_url_storage[0..profile_base_url_len];
+pub fn formatWireUrl(
+    alloc: std.mem.Allocator,
+    base_url: []const u8,
+    style: ApiStyle,
+) ![]u8 {
+    var buf: [1024]u8 = undefined;
+    const formatted = resolveWireUrl(&buf, base_url, style) catch {
+        if (!std.mem.eql(u8, base_url, default_base_url)) return error.OpenAiWireUrlTooLong;
+        const suffix = switch (style) {
+            .chat => chat_completions_suffix,
+            .responses => responses_suffix,
+        };
+        return std.fmt.allocPrint(alloc, "{s}{s}", .{ default_base_url, suffix });
+    };
+    return try alloc.dupe(u8, formatted);
 }
 
 /// Writes `{base}/chat/completions` into `buf` and returns the used slice.
@@ -276,34 +199,28 @@ pub fn formatModelsUrl(alloc: std.mem.Allocator, base_url: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}{s}", .{ trimmed, suffix });
 }
 
-test "buildTransportRoute snapshots OpenAI wire endpoints for OpenAI credentials" {
-    const alloc = std.testing.allocator;
-    configureProfileApiStyle("responses");
-    defer configureProfileApiStyle(null);
-    try std.testing.expect(configureProfileBaseUrl("https://litellm.example/v1"));
-    defer {
-        _ = configureProfileBaseUrl(null);
-    }
+test "resolveOpenAiApiStyleFromSettings prefers env over profile" {
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put(openai_api_style_env, "responses");
+    const stable = try stableOpenAiTransportTestEnviron();
+    io_mod.setEnvironMap(&map);
+    defer io_mod.setEnvironMap(stable);
 
-    var route = try buildTransportRoute(alloc, .openai_api_key);
-    defer route.deinit(alloc);
-    try std.testing.expectEqual(WireKind.openai_responses, route.wire_kind);
-    try std.testing.expectEqualStrings("https://litellm.example/v1/responses", route.wire_url);
-    try std.testing.expectEqualStrings("https://litellm.example/v1/models", route.models_url);
+    try std.testing.expectEqual(
+        ApiStyle.responses,
+        resolveOpenAiApiStyleFromSettings(.{ .openai_api_style = "chat" }),
+    );
 }
 
-test "buildTransportRoute returns gateway route for non-OpenAI credentials" {
-    const alloc = std.testing.allocator;
-    var route = try buildTransportRoute(alloc, .ai_gateway_api_key);
-    defer route.deinit(alloc);
-    try std.testing.expectEqual(WireKind.gateway, route.wire_kind);
-    try std.testing.expectEqualStrings("https://gateway.example/chat", route.chatUrl("https://gateway.example/chat"));
-}
+test "resolveOpenAiBaseUrlFromSettings uses profile when env unset" {
+    const stable = try stableOpenAiTransportTestEnviron();
+    io_mod.setEnvironMap(stable);
 
-test "resolveOpenAiApiStyle uses profile when env unset" {
-    configureProfileApiStyle("responses");
-    defer configureProfileApiStyle(null);
-    try std.testing.expectEqual(ApiStyle.responses, resolveOpenAiApiStyle());
+    try std.testing.expectEqualStrings(
+        "https://litellm.example/v1",
+        resolveOpenAiBaseUrlFromSettings(.{ .openai_base_url = "https://litellm.example/v1" }),
+    );
 }
 
 test "ApiStyle parse accepts chat and responses" {
@@ -319,18 +236,6 @@ test "formatResponsesUrl composes base and suffix" {
 
     const ollama = try formatResponsesUrl(&buf, "http://127.0.0.1:11434/v1/");
     try std.testing.expectEqualStrings("http://127.0.0.1:11434/v1/responses", ollama);
-}
-
-test "configureProfileBaseUrl rejects oversized profile URLs" {
-    var oversized: [513]u8 = undefined;
-    @memset(&oversized, 'a');
-    try std.testing.expect(!configureProfileBaseUrl(oversized[0..]));
-
-    try std.testing.expect(configureProfileBaseUrl("https://litellm.example/v1"));
-    defer {
-        _ = configureProfileBaseUrl(null);
-    }
-    try std.testing.expectEqualStrings("https://litellm.example/v1", resolveOpenAiBaseUrl());
 }
 
 test "formatChatUrl composes base and suffix" {
@@ -362,30 +267,4 @@ fn stableOpenAiTransportTestEnviron() !*const std.process.Environ.Map {
     map.* = std.process.Environ.Map.init(alloc);
     stable_openai_transport_test_environ = map;
     return map;
-}
-
-test "formatWireUrl fails for oversized custom OpenAI base URL" {
-    const alloc = std.testing.allocator;
-    var long_host: [1000]u8 = undefined;
-    @memset(&long_host, 'a');
-    const oversized = try std.fmt.allocPrint(alloc, "https://{s}/v1", .{long_host[0..]});
-    defer alloc.free(oversized);
-    try std.testing.expectError(error.OpenAiWireUrlTooLong, formatWireUrl(alloc, oversized, .chat));
-}
-
-test "buildTransportRoute fails closed on oversized OpenAI base URL" {
-    const alloc = std.testing.allocator;
-    var long_host: [1000]u8 = undefined;
-    @memset(&long_host, 'a');
-    const oversized = try std.fmt.allocPrint(alloc, "https://{s}/v1", .{long_host[0..]});
-    defer alloc.free(oversized);
-
-    var map = std.process.Environ.Map.init(alloc);
-    defer map.deinit();
-    try map.put(openai_base_url_env, oversized);
-    const stable = try stableOpenAiTransportTestEnviron();
-    io_mod.setEnvironMap(&map);
-    defer io_mod.setEnvironMap(stable);
-
-    try std.testing.expectError(error.OpenAiWireUrlTooLong, buildTransportRoute(alloc, .openai_api_key));
 }

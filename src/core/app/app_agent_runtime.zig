@@ -1088,6 +1088,10 @@ pub fn Runtime(comptime App: type) type {
                         .agent_stream_provider = tool_context.agent_stream_provider,
                         .permission_reviewer_provider = tool_context.permission_reviewer_provider,
                     },
+                    .openai = .{
+                        .agent_stream_provider = tool_context.agent_stream_provider,
+                        .permission_reviewer_provider = tool_context.permission_reviewer_provider,
+                    },
                 };
             return subagent_agent_adapter.run(.{
                 .host = app_session_runtime.Runtime(App).subagentHost(app) orelse
@@ -1519,7 +1523,7 @@ const FakeApp = struct {
             .source = .ai_gateway_api_key,
         };
         defer credential.deinit(alloc);
-        _ = app.auth.adoptCredential(alloc, &credential);
+        _ = try app.auth.adoptCredential(alloc, &credential);
         errdefer app.auth.deinit(alloc);
         try app.selected_model.appendSlice(alloc, "test-model");
         return app;
@@ -1992,7 +1996,7 @@ test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
         .source = .chatgpt_subscription,
     };
     defer credential.deinit(alloc);
-    _ = app.auth.adoptCredential(alloc, &credential);
+    _ = try app.auth.adoptCredential(alloc, &credential);
     app.selected_provider = .codex;
 
     const ctx = Runtime(FakeApp).toolContext(

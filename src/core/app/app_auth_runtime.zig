@@ -120,7 +120,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
-                    .body = "Usage: /provider [gateway|codex]",
+                    .body = "Usage: /provider [gateway|codex|openai]",
                 }, true);
                 return;
             };
@@ -615,7 +615,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
-                    .body = "Codex provider switching is unavailable in this WASM session.",
+                    .body = "Provider switching is unavailable in this WASM session.",
                 }, true);
                 return;
             }
@@ -649,13 +649,25 @@ pub fn Runtime(comptime App: type) type {
             }
             try app.flushBeforeBlockingExternalWork();
 
+            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "Could not load settings. The current provider is unchanged.",
+                }, true);
+                return;
+            };
+            defer settings.deinit(app.alloc);
+
             const resolution = credentials.resolveForProvider(
                 app.alloc,
                 app.auth.oauthTransport(),
                 app.auth.secretStore(),
                 .refresh_if_needed,
                 target,
-                null,
+                settings.credential_source,
+                settings.openai_api_key,
             ) catch |err| {
                 debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
                 try app.writeDomainNotice(.{
@@ -673,10 +685,11 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
-                    .body = if (target == .codex)
-                        "Run fx login codex, then try switching again."
-                    else
-                        credentials.missing_interactive_credential_message,
+                    .body = switch (target) {
+                        .codex => "Run fx login codex, then try switching again.",
+                        .openai => credentials.missing_openai_interactive_credential_message,
+                        .gateway => credentials.missing_interactive_credential_message,
+                    },
                 }, true);
                 return;
             };
@@ -690,34 +703,55 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
+            const saved_model = switch (target) {
+                .gateway => settings.model,
+                .codex => settings.codex_model,
+                .openai => settings.openai_model,
+            };
             const access = credentials.catalogAccessForCredential(
                 credential.source,
                 credential.token,
                 credential.gatewayTeam(),
             );
-            const fetched = app.fetchProviderCatalog(target, access) catch |err| {
-                debug_trace.logf("provider", "catalog preparation failed provider={t} err={s}", .{ target, @errorName(err) });
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .@"error",
-                    .body = "Could not load the target provider catalog. The current provider is unchanged.",
-                }, true);
-                return;
+            var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+            var catalog_loaded = false;
+            defer if (catalog_loaded) model_catalog.freeModelCatalog(app.alloc, &catalog);
+            const fetch_result = blk: {
+                const result = app.fetchProviderCatalog(target, access) catch |err| {
+                    debug_trace.logf("provider", "catalog preparation failed provider={t} err={s}", .{ target, @errorName(err) });
+                    if (model_provider.resolveSwitchModel(&.{}, saved_model, io_mod.getenv("FX_MODEL")) == null) {
+                        try app.writeDomainNotice(.{
+                            .topic = "provider",
+                            .tone = .@"error",
+                            .body = "Could not load the target provider catalog. The current provider is unchanged.",
+                        }, true);
+                        return;
+                    }
+                    break :blk null;
+                };
+                break :blk result;
             };
-            var catalog = switch (fetched) {
-                .catalog => |catalog| catalog,
-                .failure => |failure| {
-                    debug_trace.logf("provider", "catalog rejected provider={t} category={t}", .{ target, failure.category });
-                    try app.writeDomainNotice(.{
-                        .topic = "provider",
-                        .tone = .@"error",
-                        .body = "The target provider catalog could not be validated. The current provider is unchanged.",
-                    }, true);
-                    return;
-                },
-            };
-            defer model_catalog.freeModelCatalog(app.alloc, &catalog);
-            if (catalog.items.len == 0) {
+            if (fetch_result) |fetched| {
+                switch (fetched) {
+                    .catalog => |loaded| {
+                        catalog = loaded;
+                        catalog_loaded = true;
+                    },
+                    .failure => |failure| {
+                        debug_trace.logf("provider", "catalog rejected provider={t} category={t}", .{ target, failure.category });
+                        if (model_provider.resolveSwitchModel(&.{}, saved_model, io_mod.getenv("FX_MODEL")) == null) {
+                            try app.writeDomainNotice(.{
+                                .topic = "provider",
+                                .tone = .@"error",
+                                .body = "The target provider catalog could not be validated. The current provider is unchanged.",
+                            }, true);
+                            return;
+                        }
+                    },
+                }
+            }
+            const catalog_entries = if (catalog_loaded) catalog.items else &.{};
+            if (catalog_entries.len == 0 and model_provider.resolveSwitchModel(&.{}, saved_model, io_mod.getenv("FX_MODEL")) == null) {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
@@ -725,38 +759,26 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
-                debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
+            const selected = model_provider.resolveSwitchModel(
+                catalog_entries,
+                saved_model,
+                io_mod.getenv("FX_MODEL"),
+            ) orelse {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = "Could not load the saved provider model. The current provider is unchanged.",
+                    .body = "The target provider returned no supported models. The current provider is unchanged.",
                 }, true);
                 return;
             };
-            defer settings.deinit(app.alloc);
-            const saved_model = switch (target) {
-                .gateway => settings.model,
-                .codex => settings.codex_model,
-            };
-            const requested_model = io_mod.getenv("FX_MODEL") orelse saved_model;
-            var selected: ?[]const u8 = null;
-            if (requested_model) |candidate| {
-                for (catalog.items) |entry| {
-                    if (std.mem.eql(u8, candidate, entry.id)) {
-                        selected = entry.id;
-                        break;
-                    }
-                }
-            }
-            if (selected == null) selected = catalog.items[0].id;
-            var owned_model = try app.alloc.dupe(u8, selected.?);
+            var owned_model = try app.alloc.dupe(u8, selected);
             errdefer app.alloc.free(owned_model);
 
-            app.model_cache.adoptOwnedCatalog(access, &catalog);
+            if (catalog_loaded) {
+                app.model_cache.adoptOwnedCatalog(access, &catalog);
+            }
             app.provider_selection.adoptOwned(target, &owned_model);
-            _ = app.auth.adoptCredential(app.alloc, &credential);
+            _ = try app.auth.adoptCredential(app.alloc, &credential);
             reconcileGatewayCredential(app);
 
             const body = try std.fmt.allocPrint(
@@ -792,6 +814,7 @@ pub fn Runtime(comptime App: type) type {
                 var persistence = config_runtime.attemptUserPreferences(app.alloc, switch (target) {
                     .gateway => .{ .provider = .gateway, .model = provider_runtime.model(app) },
                     .codex => .{ .provider = .codex, .codex_model = provider_runtime.model(app) },
+                    .openai => .{ .provider = .openai, .openai_model = provider_runtime.model(app) },
                 });
                 defer persistence.deinit(app.alloc);
                 switch (persistence) {

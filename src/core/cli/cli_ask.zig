@@ -15,6 +15,8 @@ const process_supervisor = @import("../background/process_supervisor.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const devbox_executor = @import("../execution/devbox_executor.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const openai_compatible = @import("../../gateway/openai_compatible.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
@@ -280,6 +282,10 @@ fn runAskChild(
             .codex = .{
                 .agent_stream_provider = ctx.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
                 .permission_reviewer_provider = ctx.cfg.codex_permission_reviewer_provider,
+            },
+            .openai = .{
+                .agent_stream_provider = ctx.agentStreamProvider(),
+                .permission_reviewer_provider = ctx.cfg.permission_reviewer_provider,
             },
         },
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
@@ -584,6 +590,11 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
+    openai_config: openai_compatible.OpenAiCompatibleConfig = .{
+        .base_url = openai_transport.default_base_url,
+        .api_style = .chat,
+    },
+    openai_base_url_owned: []u8 = &.{},
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -746,6 +757,7 @@ const AskContext = struct {
         self.tool_call_records.deinit(self.alloc);
         if (self.subagent_skills_prompt.len > 0) self.alloc.free(self.subagent_skills_prompt);
         if (self.subagent_explicit_skills_prompt.len > 0) self.alloc.free(self.subagent_explicit_skills_prompt);
+        if (self.openai_base_url_owned.len > 0) self.alloc.free(self.openai_base_url_owned);
     }
 
     fn lifecycleContext(self: *AskContext) agent_runtime.LifecycleContext {
@@ -1059,6 +1071,7 @@ const AskContext = struct {
         const provider = switch (self.provider) {
             .gateway => self.cfg.permission_reviewer_provider,
             .codex => self.cfg.codex_permission_reviewer_provider,
+            .openai => self.cfg.permission_reviewer_provider,
         } orelse
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
@@ -1075,6 +1088,11 @@ const AskContext = struct {
         return switch (self.provider) {
             .gateway => self.cfg.gateway_provider.agent_stream,
             .codex => self.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
+            .openai => .{
+                .context = @ptrCast(@alignCast(@constCast(&self.openai_config))),
+                .build_fn = openai_compatible.agent_stream_provider.build_fn,
+                .stream_fn = openai_compatible.agent_stream_provider.stream_fn,
+            },
         };
     }
 
@@ -1381,10 +1399,11 @@ fn missingCredentialResult(
     options: RunOptions,
     provider: model_provider.ProviderId,
 ) !PromptRunResult {
-    const message = if (provider == .codex)
-        credentials.missing_chatgpt_credential_message
-    else
-        credentials.missing_credential_message;
+    const message = switch (provider) {
+        .codex => credentials.missing_chatgpt_credential_message,
+        .openai => credentials.missing_openai_credential_message,
+        .gateway => credentials.missing_credential_message,
+    };
     try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
     try options.deps.write_stderr(options.deps.stderr_ctx, message);
     try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
@@ -1468,6 +1487,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.command_timeout_ms = options.command_timeout_ms;
     ctx.model = startup.selected_model;
     ctx.provider = startup.provider;
+    ctx.openai_base_url_owned = startup.takeOpenAiBaseUrl();
+    ctx.openai_config = startup.openAiCompatibleConfig();
+    if (ctx.openai_base_url_owned.len > 0) ctx.openai_config.base_url = ctx.openai_base_url_owned;
     ctx.seed_model = startup.configured_model;
     ctx.requested_resume = options.resume_target;
     ctx.agent_step_limit = startup.agent_step_limit;
@@ -1539,6 +1561,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             .refresh_if_needed,
             ctx.provider,
             preferred,
+            startup.profileOpenAiApiKey(),
         );
         routed_credential = resolution.credential;
         if (routed_credential == null) {
@@ -2007,6 +2030,7 @@ fn selectModelCatalog(
     return switch (provider) {
         .gateway => gateway,
         .codex => codex,
+        .openai => null,
     };
 }
 

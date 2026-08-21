@@ -386,7 +386,7 @@ pub const PickerView = struct {
                 4
             else
                 5,
-            .provider => 2,
+            .provider => @typeInfo(model_provider.ProviderId).@"enum".fields.len,
             .sign_in, .api_key => 0,
             .change_team => blk: {
                 var count: usize = 0;
@@ -430,10 +430,10 @@ pub const PickerView = struct {
                 4 => .{ .action = .switch_credential },
                 else => null,
             },
-            .provider => switch (index) {
-                0 => .{ .provider = .gateway },
-                1 => .{ .provider = .codex },
-                else => null,
+            .provider => blk: {
+                const fields = @typeInfo(model_provider.ProviderId).@"enum".fields;
+                if (index >= fields.len) return null;
+                break :blk .{ .provider = @enumFromInt(index) };
             },
             .sign_in, .api_key => null,
             .change_team => blk: {
@@ -574,6 +574,12 @@ pub const StatusSnapshot = struct {
                 .interactive => credentials.missing_chatgpt_interactive_credential_message,
             };
         }
+        if (self.required_source == .openai_api_key) {
+            return switch (surface) {
+                .cli => credentials.missing_openai_credential_message,
+                .interactive => credentials.missing_openai_interactive_credential_message,
+            };
+        }
         return switch (surface) {
             .cli => credentials.missing_credential_message,
             .interactive => credentials.missing_interactive_credential_message,
@@ -600,7 +606,7 @@ pub fn loadStatusSnapshot(
     secret_store: host.SecretStore,
     preferred: ?credentials.Source,
 ) !StatusSnapshot {
-    return loadStatusSnapshotForProvider(alloc, secret_store, null, preferred);
+    return loadStatusSnapshotForProvider(alloc, secret_store, null, preferred, null);
 }
 
 pub fn loadStatusSnapshotForProvider(
@@ -608,6 +614,7 @@ pub fn loadStatusSnapshotForProvider(
     secret_store: host.SecretStore,
     provider: ?model_provider.ProviderId,
     preferred: ?credentials.Source,
+    profile_openai_api_key: ?[]const u8,
 ) !StatusSnapshot {
     const chatgpt_connected = credentials.sourceExists(
         alloc,
@@ -628,6 +635,7 @@ pub fn loadStatusSnapshotForProvider(
             .stored,
             selected_provider,
             preferred,
+            profile_openai_api_key,
         )
     else
         credentials.resolvePreferring(
@@ -675,7 +683,14 @@ pub fn loadStatusSnapshotForProvider(
         };
     }
     return .{
-        .required_source = if (provider == .codex) .chatgpt_subscription else null,
+        .required_source = if (provider) |selected|
+            switch (selected) {
+                .codex => .chatgpt_subscription,
+                .openai => .openai_api_key,
+                .gateway => null,
+            }
+        else
+            null,
         .stored_key_status = resolution.stored_key_status,
         .gateway_connected = gateway_connected,
         .chatgpt_connected = chatgpt_connected,
@@ -731,7 +746,6 @@ pub const Runtime = struct {
     api_key_input: std.ArrayList(u8) = .empty,
     api_key_returns_to_root: bool = false,
     api_key_save: ApiKeySaveRuntime = .{},
-    transport_route: openai_transport.TransportRoute = .{},
 
     pub fn init(
         validator: api_key_validator.Provider,
@@ -752,25 +766,14 @@ pub const Runtime = struct {
         self.clearTeamSelection(alloc);
         self.team_query.deinit(alloc);
         if (self.selected_credential) |*credential| credential.deinit(alloc);
-        self.transport_route.deinit(alloc);
         self.* = .{};
     }
 
-    pub fn gatewayChatUrl(self: *const Self, gateway_fallback: []const u8) []const u8 {
-        const base = self.transport_route.chatUrl(gateway_fallback);
+    pub fn gatewayChatUrl(_: *const Self, gateway_fallback: []const u8) []const u8 {
         return openai_transport.resolveGatewayChatUrl(
-            base,
+            gateway_fallback,
             io_mod.getenv(openai_transport.gateway_chat_url_env),
         );
-    }
-
-    pub fn gatewayWireKind(self: *const Self) openai_transport.WireKind {
-        return self.transport_route.wire_kind;
-    }
-
-    fn refreshTransportRoute(self: *Self, alloc: Allocator) !void {
-        self.transport_route.deinit(alloc);
-        self.transport_route = try openai_transport.buildTransportRoute(alloc, self.credentialSource());
     }
 
     /// Borrows the current credential until this runtime replaces or releases it.
@@ -1308,11 +1311,7 @@ pub const Runtime = struct {
             true;
         const source = credential.source;
 
-        var new_route = try openai_transport.buildTransportRoute(alloc, source);
-        errdefer new_route.deinit(alloc);
-
         if (self.selected_credential) |*selected| selected.deinit(alloc);
-        self.transport_route.deinit(alloc);
 
         self.selected_credential = credential.*;
         self.credential_refresh_failure_source = null;
@@ -1322,7 +1321,6 @@ pub const Runtime = struct {
         credential.team_slug = null;
         self.source_inventory.insert(source);
         if (source == .stored_key) self.stored_key_status = .not_attempted;
-        self.transport_route = new_route;
         return changed;
     }
 
@@ -1373,7 +1371,8 @@ pub const Runtime = struct {
                     self,
                     loadRuntimeCredentialSource,
                 ),
-            .gateway => if (self.credentialSource() != .chatgpt_subscription)
+            .gateway => if (self.credentialSource() != .chatgpt_subscription and
+                self.credentialSource() != .openai_api_key)
                 false
             else
                 @as(?bool, try self.reselectByPrecedenceWithDeps(
@@ -1382,6 +1381,15 @@ pub const Runtime = struct {
                     probeCredentialSource,
                     loadRuntimeCredentialSource,
                 )),
+            .openai => if (self.credentialSource() == .openai_api_key)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .openai_api_key,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
         };
     }
 
@@ -1415,11 +1423,10 @@ pub const Runtime = struct {
         if (self.selected_credential) |*credential| credential.deinit(alloc);
         self.selected_credential = null;
         self.credential_refresh_failure_source = null;
-        try self.refreshTransportRoute(alloc);
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
         for (credential_source_order) |source| {
-            if (source == .chatgpt_subscription) continue;
+            if (source == .chatgpt_subscription or source == .openai_api_key) continue;
             if (!self.source_inventory.contains(source)) continue;
             if (try self.selectSourceWithLoader(alloc, source, ctx, loader) != null) {
                 return self.credentialSource() != previous;
@@ -1463,14 +1470,13 @@ pub const Runtime = struct {
             if (self.selected_credential) |*credential| credential.deinit(alloc);
             self.selected_credential = null;
             self.credential_refresh_failure_source = null;
-            try self.refreshTransportRoute(alloc);
         }
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
         if (!login_was_active) return false;
 
         for (credential_source_order) |source| {
-            if (source == .chatgpt_subscription) continue;
+            if (source == .chatgpt_subscription or source == .openai_api_key) continue;
             if (!self.source_inventory.contains(source)) continue;
             if (try self.selectSourceWithLoader(alloc, source, ctx, loader) != null) return true;
             self.source_inventory.remove(source);
@@ -1566,7 +1572,7 @@ fn takeDisplayTeam(alloc: Allocator, credential: *credentials.Credential) ?[]u8 
 fn gatewaySourceCount(sources: SourceSet) usize {
     var count: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or !sources.contains(source)) continue;
+        if (source == .chatgpt_subscription or source == .openai_api_key or !sources.contains(source)) continue;
         count += 1;
     }
     return count;
@@ -1575,7 +1581,7 @@ fn gatewaySourceCount(sources: SourceSet) usize {
 fn gatewaySourceAtIndex(sources: SourceSet, wanted_index: usize) ?credentials.Source {
     var index: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or !sources.contains(source)) continue;
+        if (source == .chatgpt_subscription or source == .openai_api_key or !sources.contains(source)) continue;
         if (index == wanted_index) return source;
         index += 1;
     }
@@ -1808,7 +1814,18 @@ test "catalog access records a refresh failure until another credential is adopt
     try std.testing.expectEqualStrings("api-key", authenticated.authorizationCredential().?);
 }
 
-test "auth runtime rebuilds transport route when credential changes" {
+test "auth runtime gateway chat url resolves loopback override only" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "https://ai-gateway.vercel.sh/v3/ai/language-model",
+        runtime.gatewayChatUrl("https://ai-gateway.vercel.sh/v3/ai/language-model"),
+    );
+}
+
+test "auth runtime adoptCredential keeps gateway chat url stable across sources" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -1816,23 +1833,15 @@ test "auth runtime rebuilds transport route when credential changes" {
     var gateway = try makeTestCredential(alloc, "gw-key", .ai_gateway_api_key, null, null);
     defer gateway.deinit(alloc);
     _ = try runtime.adoptCredential(alloc, &gateway);
-    try std.testing.expectEqual(openai_transport.WireKind.gateway, runtime.transport_route.wire_kind);
+
+    var openai = try makeTestCredential(alloc, "oa-key", .openai_api_key, null, null);
+    defer openai.deinit(alloc);
+    _ = try runtime.adoptCredential(alloc, &openai);
+    try std.testing.expectEqual(credentials.Source.openai_api_key, runtime.credentialSource().?);
     try std.testing.expectEqualStrings(
         "https://ai-gateway.vercel.sh/v3/ai/language-model",
         runtime.gatewayChatUrl("https://ai-gateway.vercel.sh/v3/ai/language-model"),
     );
-
-    var openai = try makeTestCredential(alloc, "oa-key", .openai_api_key, null, null);
-    defer openai.deinit(alloc);
-    openai_transport.configureProfileApiStyle("chat");
-    defer openai_transport.configureProfileApiStyle(null);
-    _ = try runtime.adoptCredential(alloc, &openai);
-    try std.testing.expectEqual(openai_transport.WireKind.openai_chat, runtime.transport_route.wire_kind);
-    try std.testing.expect(std.mem.endsWith(
-        u8,
-        runtime.gatewayChatUrl("https://ai-gateway.vercel.sh/v3/ai/language-model"),
-        openai_transport.chat_completions_suffix,
-    ));
 }
 
 var stable_auth_runtime_test_environ: ?*std.process.Environ.Map = null;
@@ -1847,20 +1856,8 @@ fn stableAuthRuntimeTestEnviron() !*const std.process.Environ.Map {
     return map;
 }
 
-test "auth runtime adoptCredential leaves session unchanged when route build fails" {
+test "auth runtime adoptCredential replaces active credential" {
     const alloc = std.testing.allocator;
-    var long_host: [1000]u8 = undefined;
-    @memset(&long_host, 'a');
-    const oversized = try std.fmt.allocPrint(alloc, "https://{s}/v1", .{long_host[0..]});
-    defer alloc.free(oversized);
-
-    var env_map = std.process.Environ.Map.init(alloc);
-    defer env_map.deinit();
-    try env_map.put(openai_transport.openai_base_url_env, oversized);
-    const stable_environ = try stableAuthRuntimeTestEnviron();
-    io_mod.setEnvironMap(&env_map);
-    defer io_mod.setEnvironMap(stable_environ);
-
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
@@ -1870,11 +1867,9 @@ test "auth runtime adoptCredential leaves session unchanged when route build fai
 
     var openai = try makeTestCredential(alloc, "oa-key", .openai_api_key, null, null);
     defer openai.deinit(alloc);
-
-    try std.testing.expectError(error.OpenAiWireUrlTooLong, runtime.adoptCredential(alloc, &openai));
-    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, runtime.credentialSource().?);
-    try std.testing.expectEqual(openai_transport.WireKind.gateway, runtime.transport_route.wire_kind);
-    try std.testing.expectEqualStrings("gw-key", runtime.apiKey().?);
+    _ = try runtime.adoptCredential(alloc, &openai);
+    try std.testing.expectEqual(credentials.Source.openai_api_key, runtime.credentialSource().?);
+    try std.testing.expectEqualStrings("oa-key", runtime.apiKey().?);
 }
 
 test "auth runtime adopts credential ownership and prefers team id" {
@@ -2094,6 +2089,14 @@ test "auth runtime detects only credential sources that exist" {
     try std.testing.expect(!inventory.contains(.stored_key));
 }
 
+test "gateway credential switcher excludes openai_api_key" {
+    var sources = SourceSet.empty;
+    sources.insert(.openai_api_key);
+    sources.insert(.ai_gateway_api_key);
+    try std.testing.expectEqual(@as(usize, 1), gatewaySourceCount(sources));
+    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, gatewaySourceAtIndex(sources, 0).?);
+}
+
 test "auth runtime owns onboarding skip state" {
     var runtime: Runtime = .{};
 
@@ -2308,6 +2311,24 @@ test "auth picker root starts on sign in and keeps sources in the switch stage" 
     try std.testing.expect(picker.choiceAt(5) == null);
 }
 
+test "provider picker lists gateway codex and openai" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.openProviderPicker(alloc, .codex);
+
+    const picker = runtime.pickerView();
+    try std.testing.expectEqual(PickerStage.provider, picker.stage);
+    try std.testing.expectEqual(@as(usize, 3), picker.choiceCount());
+    try std.testing.expect((Choice{ .provider = .gateway }).eql(picker.choiceAt(0).?));
+    try std.testing.expect((Choice{ .provider = .codex }).eql(picker.choiceAt(1).?));
+    try std.testing.expect((Choice{ .provider = .openai }).eql(picker.choiceAt(2).?));
+    try std.testing.expectEqualStrings(
+        model_provider.label(.openai),
+        picker.choiceLabel(.{ .provider = .openai }),
+    );
+}
+
 test "credential switcher excludes provider-routed ChatGPT sessions" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
@@ -2408,7 +2429,7 @@ test "clearing a remembered choice re-resolves even when no login was active" {
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, runtime.credentialSource().?);
 }
 
-test "switch credential stage includes OpenAI in inventory without panic" {
+test "switch credential stage excludes OpenAI from gateway inventory" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -2421,12 +2442,11 @@ test "switch credential stage includes OpenAI in inventory without panic" {
     runtime.openSwitchCredentialPicker(alloc);
 
     const switch_view = runtime.pickerView();
-    try std.testing.expectEqual(@as(usize, 4), switch_view.choiceCount());
-    try std.testing.expect((Choice{ .source = .openai_api_key }).eql(switch_view.choiceAt(1).?));
-    try std.testing.expectEqualStrings(
-        credentials.sourceLabel(.openai_api_key),
-        switch_view.choiceLabel(switch_view.choiceAt(1).?),
-    );
+    try std.testing.expectEqual(@as(usize, 3), switch_view.choiceCount());
+    for (0..switch_view.choiceCount()) |index| {
+        const choice = switch_view.choiceAt(index).?;
+        try std.testing.expect(!choice.eql(.{ .source = .openai_api_key }));
+    }
 }
 
 test "switch credential stage includes the active source and pops to its root action" {

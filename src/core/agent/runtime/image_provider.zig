@@ -20,7 +20,6 @@ pub const Request = struct {
     session_id: ?[]const u8 = null,
     retry_count: usize,
     chat_url: []const u8,
-    wire_kind: agent_stream_provider.WireKind = .gateway,
     cancel_flag: *std.atomic.Value(bool),
     usage: ?*session_usage.Usage = null,
     usage_allocator: Allocator = std.heap.c_allocator,
@@ -63,7 +62,6 @@ pub fn inspect(
             .budget = .{ .cancel_flag = request.cancel_flag },
             .verified_images = images,
             .response_format = request.response_format,
-            .wire_kind = request.wire_kind,
         },
     );
     defer alloc.free(payload);
@@ -85,7 +83,6 @@ pub fn inspect(
         model,
         request.retry_count,
         request.chat_url,
-        request.wire_kind,
         payload,
         null,
         &delivery,

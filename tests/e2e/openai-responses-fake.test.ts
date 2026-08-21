@@ -1,8 +1,30 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+
+function createIsolatedHome() {
+  const home = mkdtempSync(join(tmpdir(), "fx-e2e-openai-home-"));
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  writeFileSync(join(home, ".fx", "settings.json"), "{}\n");
+  return home;
+}
+
+function openAiAskEnv(
+  home: string,
+  extra: Record<string, string | undefined> = {},
+): Record<string, string | undefined> {
+  return {
+    HOME: home,
+    OPENAI_API_KEY: "test-openai-key",
+    AI_GATEWAY_API_KEY: undefined,
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_MODEL: "gpt-test",
+    FX_SKIP_ONBOARDING: "1",
+    ...extra,
+  };
+}
 
 function responsesSse(events: object[]) {
   return new Response(
@@ -93,18 +115,14 @@ describe("openai responses fake gateway", () => {
         responsesSse(responsesTextEvents("hello from responses fake")),
       ]);
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-openai-responses-"));
+      const home = createIsolatedHome();
       try {
         const result = await runFx(["ask", "--json", "Say hello"], {
           cwd: root,
-          env: {
-            OPENAI_API_KEY: "test-openai-key",
-            AI_GATEWAY_API_KEY: undefined,
-            VERCEL_OIDC_TOKEN: undefined,
+          env: openAiAskEnv(home, {
             FX_OPENAI_BASE_URL: fake.baseUrl,
             FX_OPENAI_API_STYLE: "responses",
-            FX_MODEL: "gpt-test",
-            FX_SKIP_ONBOARDING: "1",
-          },
+          }),
           timeoutMs: 30_000,
         });
         expect(result.code).toBe(0);
@@ -119,6 +137,7 @@ describe("openai responses fake gateway", () => {
       } finally {
         fake.close();
         rmSync(root, { recursive: true, force: true });
+        rmSync(home, { recursive: true, force: true });
       }
     },
     60_000,
@@ -137,21 +156,17 @@ describe("openai responses fake gateway", () => {
         ),
         responsesSse(responsesTextEvents("READ_TOOL_DONE")),
       ]);
+      const home = createIsolatedHome();
 
       try {
         const result = await runFx(
           ["ask", "--yolo", "--json", "--no-save", "Read the fixture file once."],
           {
             cwd: root,
-            env: {
-              OPENAI_API_KEY: "test-openai-key",
-              AI_GATEWAY_API_KEY: undefined,
-              VERCEL_OIDC_TOKEN: undefined,
+            env: openAiAskEnv(home, {
               FX_OPENAI_BASE_URL: fake.baseUrl,
               FX_OPENAI_API_STYLE: "responses",
-              FX_MODEL: "gpt-test",
-              FX_SKIP_ONBOARDING: "1",
-            },
+            }),
             timeoutMs: 60_000,
           },
         );
@@ -181,6 +196,7 @@ describe("openai responses fake gateway", () => {
       } finally {
         fake.close();
         rmSync(root, { recursive: true, force: true });
+        rmSync(home, { recursive: true, force: true });
       }
     },
     90_000,
@@ -218,17 +234,13 @@ describe("openai responses fake gateway", () => {
       });
       const baseUrl = `http://127.0.0.1:${server.port}/v1`;
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-openai-chat-default-"));
+      const home = createIsolatedHome();
       try {
         const result = await runFx(["ask", "--json", "Say hello"], {
           cwd: root,
-          env: {
-            OPENAI_API_KEY: "test-openai-key",
-            AI_GATEWAY_API_KEY: undefined,
-            VERCEL_OIDC_TOKEN: undefined,
+          env: openAiAskEnv(home, {
             FX_OPENAI_BASE_URL: baseUrl,
-            FX_MODEL: "gpt-test",
-            FX_SKIP_ONBOARDING: "1",
-          },
+          }),
           timeoutMs: 30_000,
         });
         expect(result.code).toBe(0);
@@ -243,6 +255,7 @@ describe("openai responses fake gateway", () => {
       } finally {
         server.stop();
         rmSync(root, { recursive: true, force: true });
+        rmSync(home, { recursive: true, force: true });
       }
     },
     60_000,

@@ -54,6 +54,8 @@ const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_providers = @import("builtins/providers.zig");
 const openai_codex_models = @import("gateway/openai_codex_models.zig");
 const openai_codex_permission_reviewer = @import("gateway/openai_codex_permission_reviewer.zig");
+const openai_compatible = @import("gateway/openai_compatible.zig");
+const openai_transport = @import("core/gateway/openai_transport.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
@@ -436,9 +438,24 @@ const App = struct {
     }
 
     pub fn agentStreamProvider(self: *const Self) agent_stream_provider.Provider {
+        const selection = self.provider_selection.selection().provider;
+        if (selection == .openai) {
+            return .{
+                .context = @ptrCast(@alignCast(@constCast(&self.openai_config))),
+                .build_fn = openai_compatible.agent_stream_provider.build_fn,
+                .stream_fn = openai_compatible.agent_stream_provider.stream_fn,
+            };
+        }
         return self.subagentProviderRoutes()
-            .select(self.provider_selection.selection().provider)
+            .select(selection)
             .agent_stream_provider;
+    }
+
+    pub fn openAiModelCatalogProvider(self: *const Self) model_catalog.Provider {
+        return .{
+            .context = @ptrCast(@alignCast(@constCast(&self.openai_config))),
+            .fetch_fn = @import("gateway/openai_compatible_models.zig").model_catalog_provider.fetch_fn,
+        };
     }
 
     pub fn fetchProviderCatalog(
@@ -446,12 +463,30 @@ const App = struct {
         provider: model_provider.ProviderId,
         access: credentials.CatalogAccess,
     ) !model_catalog.ProviderResult {
-        return builtin_providers.modelCatalog(provider).fetch(self.alloc, .{
+        const catalog_provider = switch (provider) {
+            .gateway => builtin_gateway.model_catalog_provider,
+            .codex => openai_codex_models.model_catalog_provider,
+            .openai => self.openAiModelCatalogProvider(),
+        };
+        const endpoint = switch (provider) {
+            .gateway, .codex => builtin_gateway.models_path,
+            .openai => "",
+        };
+        return catalog_provider.fetch(self.alloc, .{
             .access = access,
-            .endpoint = builtin_gateway.models_path,
+            .endpoint = endpoint,
             .cancel_flag = &self.worker.worker_cancel_requested,
             .view = .picker,
         });
+    }
+
+    pub fn refreshOpenAiConfig(self: *App, base_url: []const u8, api_style: openai_transport.ApiStyle) !void {
+        if (self.openai_base_url_owned.len > 0) self.alloc.free(self.openai_base_url_owned);
+        self.openai_base_url_owned = try self.alloc.dupe(u8, base_url);
+        self.openai_config = .{
+            .base_url = self.openai_base_url_owned,
+            .api_style = api_style,
+        };
     }
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
@@ -498,6 +533,11 @@ const App = struct {
         if (host_target.is_wasm) host.unavailable_secret_store else native_host.secret_store,
     ),
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
+    openai_config: openai_compatible.OpenAiCompatibleConfig = .{
+        .base_url = openai_transport.default_base_url,
+        .api_style = .chat,
+    },
+    openai_base_url_owned: []u8 = &.{},
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
@@ -868,6 +908,7 @@ const App = struct {
         WorkspaceAppRuntime.deinit(self);
         self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
+        if (self.openai_base_url_owned.len > 0) self.alloc.free(self.openai_base_url_owned);
         return resume_handoff;
     }
 
@@ -1607,6 +1648,16 @@ const App = struct {
                     builtin_providers.agentStream(.codex),
                 .permission_reviewer_provider = if (comptime host_profile.tools and !host_target.is_wasm)
                     openai_codex_permission_reviewer.provider
+                else
+                    null,
+            },
+            .openai = .{
+                .agent_stream_provider = if (comptime host_target.is_wasm)
+                    agent_stream_provider.unavailable_provider
+                else
+                    builtin_providers.agentStream(.openai),
+                .permission_reviewer_provider = if (comptime host_profile.tools)
+                    builtin_gateway.permission_reviewer.provider
                 else
                     null,
             },
@@ -3272,6 +3323,8 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .codex_agent_stream = builtin_providers.agentStream(.codex),
         .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
         .codex_model_catalog = openai_codex_models.model_catalog_provider,
+        .openai_agent_stream = builtin_providers.agentStream(.openai),
+        .openai_model_catalog = builtin_providers.modelCatalog(.openai),
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3312,6 +3365,8 @@ fn localEntryConfig() app_entry_runtime.Config {
         .codex_agent_stream = builtin_providers.agentStream(.codex),
         .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
         .codex_model_catalog = openai_codex_models.model_catalog_provider,
+        .openai_agent_stream = builtin_providers.agentStream(.openai),
+        .openai_model_catalog = builtin_providers.modelCatalog(.openai),
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3350,6 +3405,8 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .codex_agent_stream = builtin_providers.agentStream(.codex),
         .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
         .codex_model_catalog = openai_codex_models.model_catalog_provider,
+        .openai_agent_stream = builtin_providers.agentStream(.openai),
+        .openai_model_catalog = builtin_providers.modelCatalog(.openai),
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3855,6 +3912,8 @@ test {
     _ = @import("gateway/openai_codex_models.zig");
     _ = @import("gateway/openai_codex.zig");
     _ = @import("gateway/openai_codex_permission_reviewer.zig");
+    _ = @import("gateway/openai_compatible_models.zig");
+    _ = @import("gateway/openai_compatible.zig");
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");

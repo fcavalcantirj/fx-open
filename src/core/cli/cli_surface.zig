@@ -17,6 +17,8 @@ const devbox_executor = @import("../execution/devbox_executor.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const openai_compatible = @import("../../gateway/openai_compatible.zig");
+const openai_compatible_models = @import("../../gateway/openai_compatible_models.zig");
 const openai_transport = @import("../gateway/openai_transport.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
@@ -27,7 +29,6 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
-const credentials = @import("../auth/credentials.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const secret = @import("../auth/secret.zig");
@@ -179,11 +180,12 @@ pub const Config = struct {
     models_path: []const u8,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
-    gateway_wire_kind: openai_transport.WireKind = .gateway,
     gateway_provider: gateway_provider.Provider,
     codex_agent_stream: ?agent_stream_provider.Provider = null,
     codex_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     codex_model_catalog: ?model_catalog.Provider = null,
+    openai_agent_stream: ?agent_stream_provider.Provider = null,
+    openai_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -223,12 +225,7 @@ fn selectCatalogModel(
     entries: []const model_catalog.ModelCatalogEntry,
     saved: ?[]const u8,
 ) ?[]const u8 {
-    if (saved) |candidate| {
-        for (entries) |entry| {
-            if (std.mem.eql(u8, entry.id, candidate)) return entry.id;
-        }
-    }
-    return if (entries.len > 0) entries[0].id else null;
+    return model_provider.resolveSwitchModel(entries, saved, io_mod.getenv("FX_MODEL"));
 }
 
 const UpgradeOptions = struct {
@@ -732,6 +729,8 @@ fn runNonInteractiveWithDeps(
                 .gateway_provider = cfg.gateway_provider,
                 .codex_agent_stream = cfg.codex_agent_stream,
                 .codex_model_catalog = cfg.codex_model_catalog,
+                .openai_agent_stream = cfg.openai_agent_stream,
+                .openai_model_catalog = cfg.openai_model_catalog,
                 .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
                 .prompt_policy = cfg.prompt_policy,
@@ -864,11 +863,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|openai>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway or codex\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, or openai\n");
                 return .handled_failure;
             };
             const workspace_root = try io_mod.realpathAlloc(alloc, ".");
@@ -880,7 +879,12 @@ fn runNonInteractiveWithDeps(
             };
             defer settings.deinit(alloc);
             if ((settings.provider orelse .gateway) == target) {
-                try writeStdout(deps, if (target == .codex) "Codex is already selected.\n" else "Gateway is already selected.\n");
+                const message = switch (target) {
+                    .codex => "Codex is already selected.\n",
+                    .openai => "OpenAI-compatible provider is already selected.\n",
+                    .gateway => "Gateway is already selected.\n",
+                };
+                try writeStdout(deps, message);
                 return .handled_success;
             }
 
@@ -891,6 +895,7 @@ fn runNonInteractiveWithDeps(
                 .refresh_if_needed,
                 target,
                 settings.credential_source,
+                settings.openai_api_key,
             );
             defer if (resolution.credential) |*credential| credential.deinit(alloc);
             if (resolution.credential == null and target == .codex) {
@@ -906,51 +911,84 @@ fn runNonInteractiveWithDeps(
                     .refresh_if_needed,
                     target,
                     settings.credential_source,
+                    settings.openai_api_key,
                 );
             }
             const credential = if (resolution.credential) |*value| value else {
-                try writeStderr(deps, if (target == .codex)
-                    "fx provider: run fx login codex first\n"
-                else
-                    "fx provider: configure a Gateway credential first\n");
+                try writeStderr(deps, switch (target) {
+                    .codex => "fx provider: run fx login codex first\n",
+                    .openai => credentials.missing_openai_credential_message,
+                    .gateway => "fx provider: configure a Gateway credential first\n",
+                });
                 return .handled_failure;
             };
-            const catalog_provider = if (target == .codex)
-                cfg.codex_model_catalog orelse {
+            var openai_config: openai_compatible.OpenAiCompatibleConfig = undefined;
+            var openai_catalog_provider = openai_compatible_models.model_catalog_provider;
+            if (target == .openai) {
+                openai_config = .{
+                    .base_url = openai_transport.resolveOpenAiBaseUrlFromSettings(.{
+                        .openai_base_url = settings.openai_base_url,
+                        .openai_api_key = settings.openai_api_key,
+                        .openai_api_style = settings.openai_api_style,
+                    }),
+                    .api_style = openai_transport.resolveOpenAiApiStyleFromSettings(.{
+                        .openai_base_url = settings.openai_base_url,
+                        .openai_api_key = settings.openai_api_key,
+                        .openai_api_style = settings.openai_api_style,
+                    }),
+                };
+                openai_catalog_provider.context = @ptrCast(@alignCast(&openai_config));
+            }
+            const catalog_provider = switch (target) {
+                .codex => cfg.codex_model_catalog orelse {
                     try writeStderr(deps, "fx provider: Codex model catalog is unavailable\n");
                     return .handled_failure;
-                }
-            else
-                cfg.gateway_provider.model_catalog;
+                },
+                .openai => openai_catalog_provider,
+                .gateway => cfg.gateway_provider.model_catalog,
+            };
+            const saved_model = switch (target) {
+                .gateway => settings.model,
+                .codex => settings.codex_model,
+                .openai => settings.openai_model,
+            };
+            var loaded_catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+            var catalog_loaded = false;
+            defer if (catalog_loaded) model_catalog.freeModelCatalog(alloc, &loaded_catalog);
             const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
                 .access = credentials.catalogAccessAt(credential.*, io_mod.milliTimestamp()),
                 .endpoint = cfg.models_path,
                 .view = .picker,
             });
-            var loaded = switch (fetch_result) {
-                .loaded => |loaded| loaded,
+            switch (fetch_result) {
+                .loaded => |loaded| {
+                    loaded_catalog = loaded.catalog;
+                    catalog_loaded = true;
+                },
                 .failed => |failure| {
                     debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
-                    const message = try std.fmt.allocPrint(
-                        alloc,
-                        "fx provider: could not load the target model catalog ({s})\n",
-                        .{@tagName(failure.failure.category)},
-                    );
-                    defer alloc.free(message);
-                    try writeStderr(deps, message);
-                    return .handled_failure;
+                    if (selectCatalogModel(&.{}, saved_model) == null) {
+                        const message = try std.fmt.allocPrint(
+                            alloc,
+                            "fx provider: could not load the target model catalog ({s})\n",
+                            .{@tagName(failure.failure.category)},
+                        );
+                        defer alloc.free(message);
+                        try writeStderr(deps, message);
+                        return .handled_failure;
+                    }
                 },
-            };
-            defer model_catalog.freeModelCatalog(alloc, &loaded.catalog);
-            const saved_model = if (target == .codex) settings.codex_model else settings.model;
-            const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
+            }
+            const catalog_entries = if (catalog_loaded) loaded_catalog.items else &.{};
+            const selected_model = selectCatalogModel(catalog_entries, saved_model) orelse {
                 try writeStderr(deps, "fx provider: target model catalog is empty\n");
                 return .handled_failure;
             };
-            var attempt = config_runtime.attemptUserPreferences(alloc, if (target == .codex)
-                .{ .provider = target, .codex_model = selected_model }
-            else
-                .{ .provider = target, .model = selected_model });
+            var attempt = config_runtime.attemptUserPreferences(alloc, switch (target) {
+                .gateway => .{ .provider = target, .model = selected_model },
+                .codex => .{ .provider = target, .codex_model = selected_model },
+                .openai => .{ .provider = target, .openai_model = selected_model },
+            });
             defer attempt.deinit(alloc);
             switch (attempt) {
                 .failure => |failure| {
@@ -960,7 +998,12 @@ fn runNonInteractiveWithDeps(
                 },
                 .outcome => {},
             }
-            try writeStdout(deps, if (target == .codex) "Provider set to Codex.\n" else "Provider set to Gateway.\n");
+            const message = switch (target) {
+                .codex => "Provider set to Codex.\n",
+                .openai => "Provider set to OpenAI-compatible.\n",
+                .gateway => "Provider set to Gateway.\n",
+            };
+            try writeStdout(deps, message);
             return .handled_success;
         },
         .setup => |rest| {
@@ -1452,7 +1495,6 @@ fn runNonInteractiveWithDeps(
                 .credential = startup.apiKey(),
                 .credential_source = if (startup.credential) |credential| credential.source else null,
                 .tenant = startup.gatewayTeam(),
-                .credential_source = if (startup.credential) |credential| credential.source else null,
             });
             defer snapshot.deinit(alloc);
             const text = try snapshot.render(alloc, opts.format);
@@ -2858,7 +2900,6 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .default_agent_step_limit = cfg.default_agent_step_limit,
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
-        .gateway_wire_kind = cfg.gateway_wire_kind,
         .gateway_models_path = cfg.models_path,
         .gateway_provider = cfg.gateway_provider,
         .codex_agent_stream = cfg.codex_agent_stream,

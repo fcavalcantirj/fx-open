@@ -4,7 +4,10 @@ const stream_provider = @import("../agent/stream_provider.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const oauth_transport = @import("../auth/oauth_transport.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
+const host = @import("../hosts/host.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
@@ -39,11 +42,13 @@ pub const ProviderRoute = struct {
 pub const ProviderRoutes = struct {
     gateway: ProviderRoute,
     codex: ProviderRoute,
+    openai: ProviderRoute,
 
     pub fn select(self: ProviderRoutes, provider: model_provider.ProviderId) ProviderRoute {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
+            .openai => self.openai,
         };
     }
 };
@@ -51,10 +56,13 @@ pub const ProviderRoutes = struct {
 test "provider routes select independent streams and reviewers" {
     var gateway_tag: u8 = 0;
     var codex_tag: u8 = 0;
+    var openai_tag: u8 = 0;
     var gateway_stream = stream_provider.unavailable_provider;
     gateway_stream.context = &gateway_tag;
     var codex_stream = stream_provider.unavailable_provider;
     codex_stream.context = &codex_tag;
+    var openai_stream = stream_provider.unavailable_provider;
+    openai_stream.context = &openai_tag;
     const Reviewer = struct {
         fn review(
             _: ?*anyopaque,
@@ -67,15 +75,19 @@ test "provider routes select independent streams and reviewers" {
     };
     const gateway_reviewer = auto_classifier.Provider{ .context = &gateway_tag, .review_fn = Reviewer.review };
     const codex_reviewer = auto_classifier.Provider{ .context = &codex_tag, .review_fn = Reviewer.review };
+    const openai_reviewer = auto_classifier.Provider{ .context = &openai_tag, .review_fn = Reviewer.review };
     const routes = ProviderRoutes{
         .gateway = .{ .agent_stream_provider = gateway_stream, .permission_reviewer_provider = gateway_reviewer },
         .codex = .{ .agent_stream_provider = codex_stream, .permission_reviewer_provider = codex_reviewer },
+        .openai = .{ .agent_stream_provider = openai_stream, .permission_reviewer_provider = openai_reviewer },
     };
 
     try std.testing.expect(routes.select(.gateway).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(routes.select(.gateway).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(routes.select(.codex).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
     try std.testing.expect(routes.select(.codex).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
+    try std.testing.expect(routes.select(.openai).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&openai_tag)));
+    try std.testing.expect(routes.select(.openai).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&openai_tag)));
 }
 
 pub const Config = struct {
@@ -183,6 +195,11 @@ pub fn run(
         admission.provider,
         config.tool_context.credential_source,
     )) {
+        const profile_openai_api_key_owned = try loadProfileOpenAiApiKeyDupe(
+            turn.alloc,
+            config.tool_context.workspace_root,
+        );
+        defer if (profile_openai_api_key_owned) |key| turn.alloc.free(key);
         const resolution = credentials.resolveForProvider(
             turn.alloc,
             config.tool_context.oauth_transport,
@@ -190,6 +207,7 @@ pub fn run(
             .refresh_if_needed,
             admission.provider,
             config.tool_context.credential_source,
+            profile_openai_api_key_owned,
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch
@@ -275,7 +293,6 @@ pub fn run(
             .explicit_skills_prompt_section = config.explicit_skills_prompt_section,
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
-            .gateway_wire_kind = config.tool_context.gateway_wire_kind,
             .gateway_tools_json = config.gateway_tools_json,
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
@@ -471,6 +488,56 @@ fn snapshotModelCatalogForView(
         initialized += 1;
     }
     return .{ .servers = servers };
+}
+
+fn loadProfileOpenAiApiKeyDupe(alloc: Allocator, workspace_root: []const u8) !?[]u8 {
+    var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch return null;
+    defer settings.deinit(alloc);
+    const key = settings.openai_api_key orelse return null;
+    return try alloc.dupe(u8, key);
+}
+
+test "subagent profile openai key resolves after settings deinit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    const settings_path = try std.fs.path.join(alloc, &.{ home, ".fx", "settings.json" });
+    defer alloc.free(settings_path);
+    var settings_file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), settings_path, .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    defer settings_file.close(io_mod.getIo());
+    try settings_file.writeStreamingAll(
+        io_mod.getIo(),
+        "{\"openai_api_key\":\"profile-only-openai-key\"}",
+    );
+
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    io_mod.setEnvironMap(&environ);
+
+    const key = try loadProfileOpenAiApiKeyDupe(alloc, home);
+    defer if (key) |value| alloc.free(value);
+    try std.testing.expect(key != null);
+
+    var resolution = try credentials.resolveForProvider(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        .refresh_if_needed,
+        .openai,
+        null,
+        key,
+    );
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+    try std.testing.expect(resolution.credential != null);
+    try std.testing.expectEqualStrings("profile-only-openai-key", resolution.credential.?.token);
 }
 
 test "subagent model catalog counts only tools in the captured MCP view" {

@@ -42,6 +42,9 @@ const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const permissions = @import("../core/permissions/permissions.zig");
+const openai_compatible = @import("../gateway/openai_compatible.zig");
+const openai_compatible_models = @import("../gateway/openai_compatible_models.zig");
+const openai_transport = @import("../core/gateway/openai_transport.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
@@ -258,6 +261,12 @@ pub const ServerState = struct {
     pending_outbound: std.AutoHashMapUnmanaged(u64, PendingOutbound) = .empty,
     legacy_url_mutex: std.Io.Mutex = .init,
     pending_legacy_urls: std.ArrayListUnmanaged(PendingLegacyUrl) = .empty,
+    openai_config: openai_compatible.OpenAiCompatibleConfig = .{
+        .base_url = openai_transport.default_base_url,
+        .api_style = .chat,
+    },
+    openai_base_url_owned: []u8 = &.{},
+    profile_openai_api_key: []u8 = &.{},
 
     pub fn deinit(self: *ServerState) void {
         reapActivePrompt(self, true);
@@ -276,6 +285,8 @@ pub const ServerState = struct {
         if (self.account_id) |account_id| self.alloc.free(account_id);
         if (self.selected_model.len > 0) self.alloc.free(self.selected_model);
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
+        if (self.openai_base_url_owned.len > 0) self.alloc.free(self.openai_base_url_owned);
+        if (self.profile_openai_api_key.len > 0) self.alloc.free(self.profile_openai_api_key);
         self.permission_rules.deinit(self.alloc);
         self.background.deinit(std.heap.c_allocator);
         self.skills.deinit(self.alloc);
@@ -300,6 +311,10 @@ fn credentialMatchesProvider(
     provider: model_provider.ProviderId,
 ) bool {
     return model_provider.authorizesCredential(provider, source);
+}
+
+fn profileOpenAiApiKey(state: *const ServerState) ?[]const u8 {
+    return if (state.profile_openai_api_key.len > 0) state.profile_openai_api_key else null;
 }
 
 fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
@@ -357,6 +372,7 @@ pub fn selectCredentialForProvider(
             .refresh_if_needed,
             provider,
             state.credential_source,
+            profileOpenAiApiKey(state),
         );
         break :blk resolution.credential orelse return false;
     };
@@ -373,6 +389,15 @@ pub fn streamProviderFor(
         .gateway => state.cfg.gateway_provider.agent_stream,
         .codex => state.cfg.codex_agent_stream orelse
             @import("../core/agent/stream_provider.zig").unavailable_provider,
+        .openai => blk: {
+            const base = state.cfg.openai_agent_stream orelse
+                @import("../core/agent/stream_provider.zig").unavailable_provider;
+            break :blk .{
+                .context = @ptrCast(@alignCast(@constCast(&state.openai_config))),
+                .build_fn = base.build_fn,
+                .stream_fn = base.stream_fn,
+            };
+        },
     };
 }
 
@@ -383,6 +408,13 @@ pub fn catalogProviderFor(
     return switch (provider) {
         .gateway => state.cfg.gateway_provider.model_catalog,
         .codex => state.cfg.codex_model_catalog,
+        .openai => blk: {
+            const base = state.cfg.openai_model_catalog orelse break :blk null;
+            break :blk .{
+                .context = @ptrCast(@alignCast(@constCast(&state.openai_config))),
+                .fetch_fn = base.fetch_fn,
+            };
+        },
     };
 }
 
@@ -1355,6 +1387,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     }
     state.provider = startup.provider;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
+    state.openai_base_url_owned = startup.takeOpenAiBaseUrl();
+    state.openai_config = startup.openAiCompatibleConfig();
+    if (state.openai_base_url_owned.len > 0) state.openai_config.base_url = state.openai_base_url_owned;
+    const profile_key = startup.takeProfileOpenAiApiKey();
+    if (profile_key.len > 0) {
+        state.profile_openai_api_key = profile_key;
+    }
 
     var startup_credential = startup.takeCredential();
     defer if (startup_credential) |*credential| credential.deinit(alloc);
@@ -1381,15 +1420,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             .refresh_if_needed,
             state.provider,
             preferred,
+            profileOpenAiApiKey(state),
         );
         routed_credential = resolution.credential;
         if (routed_credential == null) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
-                .message = if (state.provider == .codex)
-                    credentials.missing_chatgpt_credential_message
-                else
-                    credentials.missing_credential_message,
+                .message = credentials.missingCredentialMessage(state.provider, false),
             });
         }
         break :routed &routed_credential.?;
@@ -1397,10 +1434,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     if (credential.token.len == 0) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = if (state.provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else
-                credentials.missing_credential_message,
+            .message = credentials.missingCredentialMessage(state.provider, false),
         });
     }
     adoptServerCredential(state, credential);
@@ -1633,7 +1667,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             if (host_target.is_wasm) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
-                    .message = "Codex provider switching is unavailable in this WASM runtime",
+                    .message = "Provider switching is unavailable in this WASM runtime",
                 });
             }
             var staged_credential = if (target == .gateway and state.cfg.credential_override != null)
@@ -1649,14 +1683,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .refresh_if_needed,
                     target,
                     null,
+                    profileOpenAiApiKey(state),
                 );
                 break :credential resolution.credential orelse
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
-                        .message = if (target == .codex)
-                            credentials.missing_chatgpt_credential_message
-                        else
-                            credentials.missing_credential_message,
+                        .message = credentials.missingCredentialMessage(target, false),
                     });
             };
             defer staged_credential.deinit(alloc);
@@ -1671,31 +1703,6 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .code = ErrorCode.invalid_request,
                     .message = "Selected provider is unavailable in this host",
                 });
-            const access = credentials.catalogAccessForCredential(
-                staged_credential.source,
-                staged_credential.token,
-                staged_credential.gatewayTeam(),
-            );
-            const fetched = try catalog_provider.fetch(alloc, .{
-                .access = access,
-                .endpoint = state.cfg.gateway_models_path,
-                .cancel_flag = &session.cancel_flag,
-                .view = .picker,
-            });
-            var catalog = switch (fetched) {
-                .catalog => |catalog| catalog,
-                .failure => return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = "Failed to load provider model catalog",
-                }),
-            };
-            defer model_catalog.freeModelCatalog(alloc, &catalog);
-            if (catalog.items.len == 0) {
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = "Provider returned no supported models",
-                });
-            }
             var settings = if (state.cfg.home_override) |home|
                 try config_runtime.loadMergedSettingsFromHome(alloc, home, state.workspace_root)
             else
@@ -1704,16 +1711,53 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             const saved_model = switch (target) {
                 .gateway => settings.model,
                 .codex => settings.codex_model,
+                .openai => settings.openai_model,
             };
-            var selected_model = catalog.items[0].id;
-            if (saved_model) |saved| {
-                for (catalog.items) |entry| {
-                    if (std.mem.eql(u8, entry.id, saved)) {
-                        selected_model = entry.id;
-                        break;
+            const access = credentials.catalogAccessForCredential(
+                staged_credential.source,
+                staged_credential.token,
+                staged_credential.gatewayTeam(),
+            );
+            var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+            var catalog_loaded = false;
+            defer if (catalog_loaded) model_catalog.freeModelCatalog(alloc, &catalog);
+            const fetched = try catalog_provider.fetch(alloc, .{
+                .access = access,
+                .endpoint = state.cfg.gateway_models_path,
+                .cancel_flag = &session.cancel_flag,
+                .view = .picker,
+            });
+            switch (fetched) {
+                .catalog => |loaded| {
+                    catalog = loaded;
+                    catalog_loaded = true;
+                },
+                .failure => {
+                    if (model_provider.resolveSwitchModel(&.{}, saved_model, io_mod.getenv("FX_MODEL")) == null) {
+                        return state.writer.writeError(alloc, msg.id, .{
+                            .code = ErrorCode.invalid_request,
+                            .message = "Failed to load provider model catalog",
+                        });
                     }
-                }
+                },
             }
+            const catalog_entries = if (catalog_loaded) catalog.items else &.{};
+            if (catalog_entries.len == 0 and model_provider.resolveSwitchModel(&.{}, saved_model, io_mod.getenv("FX_MODEL")) == null) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Provider returned no supported models",
+                });
+            }
+            const selected_model = model_provider.resolveSwitchModel(
+                catalog_entries,
+                saved_model,
+                io_mod.getenv("FX_MODEL"),
+            ) orelse {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Provider returned no supported models",
+                });
+            };
             commitActiveSessionProvider(
                 alloc,
                 session,
@@ -1729,7 +1773,9 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .message = "Failed to persist session provider",
                 });
             };
-            state.capability_resolver.adoptOwnedCatalog(alloc, &catalog);
+            if (catalog_loaded) {
+                state.capability_resolver.adoptOwnedCatalog(alloc, &catalog);
+            }
             adoptServerCredential(state, &staged_credential);
         }
     } else if (std.mem.eql(u8, config_id, "mode")) {
@@ -2586,4 +2632,36 @@ test "ACP usage flush preserves snapshot ownership on allocation failure" {
         failing.allocated_bytes,
         failing.freed_bytes,
     );
+}
+
+test "ACP wires OpenAI-compatible stream and catalog providers" {
+    const builtin_providers = @import("../builtins/providers.zig");
+    var state: ServerState = undefined;
+    state.openai_config = .{
+        .base_url = "http://127.0.0.1:8080/v1",
+        .api_style = .chat,
+    };
+    state.cfg.openai_agent_stream = builtin_providers.agentStream(.openai);
+    state.cfg.openai_model_catalog = builtin_providers.modelCatalog(.openai);
+
+    const stream = streamProviderFor(&state, .openai);
+    try std.testing.expect(stream.context != null);
+    try std.testing.expect(stream.stream_fn == builtin_providers.agentStream(.openai).stream_fn);
+
+    const catalog = catalogProviderFor(&state, .openai) orelse return error.TestExpectedCatalog;
+    try std.testing.expect(catalog.context != null);
+    try std.testing.expect(catalog.fetch_fn == builtin_providers.modelCatalog(.openai).fetch_fn);
+}
+
+test "ACP openai config rebinds taken base URL" {
+    const custom = "http://127.0.0.1:43123/v1";
+    var state: ServerState = undefined;
+    state.openai_base_url_owned = @constCast(custom);
+    state.openai_config = .{
+        .base_url = openai_transport.default_base_url,
+        .api_style = .chat,
+    };
+    if (state.openai_base_url_owned.len > 0) state.openai_config.base_url = state.openai_base_url_owned;
+    try std.testing.expectEqualStrings(custom, state.openai_config.base_url);
+    try std.testing.expect(!std.mem.eql(u8, state.openai_config.base_url, openai_transport.default_base_url));
 }

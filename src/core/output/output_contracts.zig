@@ -741,6 +741,7 @@ pub const ModelListSnapshot = struct {
         return switch (self.provider) {
             .gateway => "gateway",
             .codex => model_provider.label(.codex),
+            .openai => model_provider.label(.openai),
         };
     }
 

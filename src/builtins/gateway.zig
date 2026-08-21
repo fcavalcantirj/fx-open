@@ -428,6 +428,9 @@ fn streamAgentCompletion(
     if (request.credential_source == .chatgpt_subscription) {
         return error.CodexCredentialCannotAuthorizeGateway;
     }
+    if (request.credential_source == .openai_api_key) {
+        return error.OpenAiCredentialCannotAuthorizeGateway;
+    }
     const result = gateway_client.streamGatewayCompletion(
         alloc,
         .{

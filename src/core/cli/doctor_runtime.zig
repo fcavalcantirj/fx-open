@@ -117,6 +117,7 @@ pub fn collect(
         secret_store,
         snapshot.provider,
         detailed.settings.credential_source,
+        detailed.settings.openai_api_key,
     );
 
     try appendConfigCheck(&checks, alloc, paths, detailed.diagnostics);
@@ -127,6 +128,7 @@ pub fn collect(
         .model = switch (snapshot.provider) {
             .gateway => detailed.settings.model,
             .codex => detailed.settings.codex_model,
+            .openai => detailed.settings.openai_model,
         },
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,

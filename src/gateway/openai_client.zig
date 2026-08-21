@@ -14,6 +14,41 @@ const DeliveryCertainty = gateway_client.DeliveryCertainty;
 
 pub const user_agent = gateway_client.user_agent;
 const max_sse_event_line_bytes: usize = 4 * 1024 * 1024;
+const connect_timeout_ms: i64 = 30_000;
+
+const OpenedChatRequest = struct {
+    request: ?std.http.Client.Request = null,
+
+    pub fn deinit(self: *OpenedChatRequest, _: Allocator) void {
+        if (self.request) |*req| req.deinit();
+        self.request = null;
+    }
+
+    pub fn take(self: *OpenedChatRequest) std.http.Client.Request {
+        const req = self.request.?;
+        self.request = null;
+        return req;
+    }
+};
+
+const ChatOpenOperation = struct {
+    client: *std.http.Client,
+    uri: std.Uri,
+    auth_header: []const u8,
+
+    pub fn run(self: *@This()) !OpenedChatRequest {
+        return .{ .request = try self.client.request(.POST, self.uri, .{
+            .headers = .{
+                .content_type = .{ .override = "application/json" },
+                .authorization = .{ .override = self.auth_header },
+                .accept_encoding = .omit,
+                .user_agent = .{ .override = user_agent },
+            },
+            .keep_alive = false,
+            .redirect_behavior = .unhandled,
+        }) };
+    }
+};
 
 pub const StreamRequest = struct {
     api_key: []const u8,
@@ -157,22 +192,29 @@ pub fn streamOpenAiCompletion(
         var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
         defer client.deinit();
 
-        var req = client.request(.POST, uri, .{
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = auth_header },
-                .accept_encoding = .omit,
-                .user_agent = .{ .override = user_agent },
-            },
-            .keep_alive = false,
-            .redirect_behavior = .unhandled,
-        }) catch |err| {
+        var open_operation = ChatOpenOperation{
+            .client = &client,
+            .uri = uri,
+            .auth_header = auth_header,
+        };
+        const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(connect_timeout_ms),
+        });
+        var opened = gateway_client.runBoundedHttpOperation(
+            OpenedChatRequest,
+            alloc,
+            cancel_flag,
+            connect_deadline,
+            &open_operation,
+        ) catch |err| {
             if (attempt + 1 < retry_count and gateway_client.isRetryableGatewayError(err)) {
                 try sleepRetry((attempt + 1) * 150 * std.time.ns_per_ms, cancel_flag);
                 continue;
             }
             return err;
         };
+        var req = opened.take();
         defer req.deinit();
 
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
