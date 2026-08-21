@@ -27,37 +27,28 @@ curl -fsSL https://fx.sh/setup.sh | bash
 
 ## Run fx
 
-By default, fx uses [Vercel AI Gateway](https://vercel.com/docs/ai-gateway). Sign in with Vercel:
+Sign in with Vercel AI Gateway:
 
 ```bash
 fx login
 ```
 
-Or add an AI Gateway API key:
+Or use an eligible ChatGPT subscription through OpenAI Codex OAuth:
+
+```bash
+fx login codex
+fx
+```
+
+Inside fx, `/provider` switches between Gateway and Codex, and `/model` lists the active provider's fetched models. Codex model IDs are the raw IDs returned by its authenticated catalog. Use `/logout codex` to remove the Codex session without affecting Vercel access.
+
+The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
+
+To use an AI Gateway API key instead:
 
 ```bash
 fx setup
 ```
-
-You can also point fx at any OpenAI-compatible server without Vercel login. By default fx uses the Chat Completions wire (`/v1/chat/completions`), which works with Ollama, Groq, LiteLLM, vLLM, and most compatible hosts:
-
-```bash
-export OPENAI_API_KEY=your-key
-export FX_MODEL=gpt-4o
-# optional: export FX_OPENAI_BASE_URL=http://127.0.0.1:11434/v1
-fx
-```
-
-For official OpenAI models that require the Responses API (for example tools plus reasoning on gpt-5.x), set the Responses wire explicitly:
-
-```bash
-export OPENAI_API_KEY=your-key
-export FX_OPENAI_API_STYLE=responses
-export FX_MODEL=gpt-5
-fx
-```
-
-Profile settings in `~/.fx/settings.json` can store `openai_api_key`, `openai_base_url`, and `openai_api_style` (`chat` or `responses`). Project `.fx.json` cannot set them.
 
 Run fx from a project:
 
@@ -67,6 +58,16 @@ fx
 ```
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
+
+The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "workspace": true
+  }
+}
+```
 
 List saved sessions with `fx sessions`. Resume the latest session for the current workspace, or select an exact session ID, through the same command group:
 
@@ -107,7 +108,7 @@ The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) an
 
 ## Extend fx
 
-Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Project instruction files may link within their scope, and read-only workspace or compatibility skill directories may link within their owning workspace or home; managed skills, `SKILL.md` files, resources, and escaping links remain no-follow. `fx status` and `fx doctor` report an invalid trusted MCP profile without starting its servers.
+Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report an invalid trusted MCP profile without starting its servers.
 
 ## Documentation
 

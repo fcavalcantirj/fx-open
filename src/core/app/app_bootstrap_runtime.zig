@@ -1,5 +1,6 @@
 const std = @import("std");
 const app_lifecycle = @import("app_lifecycle.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const app_input_runtime = @import("app_input_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
@@ -9,9 +10,11 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const openai_transport = @import("../gateway/openai_transport.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const model_provider = @import("../config/model_provider.zig");
 const host = @import("../hosts/host.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_tape = @import("../workspace/record_tape.zig");
+const statusline_identity = @import("../workspace/statusline_identity.zig");
 const shared_io = @import("../shared/io.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -41,6 +44,7 @@ fn BootstrapDeps(comptime App: type) type {
         const BootstrapInteractiveAppFn = *const fn (app_lifecycle.BootstrapConfig) anyerror!app_lifecycle.StartupState;
         const ConfigureSessionPreferencesFn = *const fn (
             *App,
+            model_provider.ProviderId,
             []const u8,
             config_runtime.ModelSource,
             []const u8,
@@ -136,6 +140,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn configureSessionPreferencesDefault(
             app: *App,
+            provider: model_provider.ProviderId,
             configured_model: []const u8,
             model_source: config_runtime.ModelSource,
             selected_model: []const u8,
@@ -144,6 +149,7 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             try app_session_runtime.Runtime(App).configureStartupPreferences(
                 app,
+                provider,
                 configured_model,
                 model_source,
                 selected_model,
@@ -216,9 +222,17 @@ pub fn Runtime(comptime App: type) type {
                 startup.stored_key_status,
                 startup.credential_onboarding_skipped,
             );
+            if (comptime @hasDecl(@TypeOf(app.auth), "refreshChatGptSourceInventory")) {
+                app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
+                    debug_trace.logf("auth", "startup ChatGPT inventory refresh failed err={s}", .{@errorName(err)});
+                };
+            } else {
+                app.auth.refreshSourceInventory(app.alloc) catch |err| {
+                    debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
+                };
+            }
             const startup_auth_view = app.auth.view();
             if (startup_auth_view.active_source == null and !startup_auth_view.onboarding_skipped) {
-                try app.auth.refreshSourceInventory(app.alloc);
                 app.auth.openOnboardingPicker(app.alloc);
             }
             if (comptime @hasField(App, "terminal_input_runtime") and @hasField(App, "terminal")) {
@@ -252,14 +266,20 @@ pub fn Runtime(comptime App: type) type {
                 );
             }
 
-            const selected_model = startup.takeSelectedModel();
+            var selected_model = startup.takeSelectedModel();
             defer if (selected_model.len > 0) app.alloc.free(selected_model);
-            try app.selected_model.appendSlice(app.alloc, selected_model);
+            if (comptime @hasField(App, "provider_selection")) {
+                app.provider_selection.adoptOwned(startup.provider, &selected_model);
+            } else {
+                try provider_runtime.replaceModel(app, selected_model);
+            }
+            const active_model = provider_runtime.model(app);
             try deps.configure_session_preferences(
                 app,
+                startup.provider,
                 startup.configured_model,
                 startup.model_source,
-                selected_model,
+                active_model,
                 startup.effort,
                 startup.fast_mode,
             );
@@ -288,6 +308,9 @@ pub fn Runtime(comptime App: type) type {
             app.statusline_sandbox = startup.statusline_sandbox;
             app.statusline_context = startup.statusline_context;
             app.statusline_session = startup.statusline_session;
+            if (comptime @hasField(App, "workspace_identity")) {
+                app.workspace_identity.enabled = startup.statusline_workspace;
+            }
             if (comptime @hasDecl(App, "setNotificationPreferences")) {
                 app.setNotificationPreferences(
                     startup.notification_turn_end,
@@ -544,6 +567,7 @@ const TestApp = struct {
     statusline_sandbox: bool = false,
     statusline_context: bool = false,
     statusline_session: bool = false,
+    workspace_identity: statusline_identity.Runtime = .{},
     requested_resume: ?u8 = null,
     mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     skills: skill_runtime.Runtime = .{},
@@ -563,6 +587,7 @@ const TestApp = struct {
             self.workspace_root = &.{};
         }
         self.auth.deinit(self.alloc);
+        self.workspace_identity.deinit(self.alloc);
         self.selected_model.deinit(self.alloc);
         self.permission_engine.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
@@ -696,6 +721,7 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     state.update_channel = .dev;
     state.effort = types.ReasoningEffort.literal("high");
     state.sandbox_backend = .none;
+    state.statusline_workspace = true;
     if (active_capture.?.emit_config_diagnostics) {
         const diagnostics = try alloc.alloc(config_runtime.ConfigDiagnostic, 2);
         errdefer alloc.free(diagnostics);
@@ -763,6 +789,7 @@ fn welcomeMessageForTest(alloc: Allocator) ![]u8 {
 
 fn configureSessionPreferencesForTest(
     _: *TestApp,
+    _: model_provider.ProviderId,
     configured_model: []const u8,
     model_source: config_runtime.ModelSource,
     selected_model: []const u8,
@@ -919,6 +946,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expect(!app.auto_upgrade_enabled);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
     try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
+    try std.testing.expect(app.workspace_identity.enabled);
     try std.testing.expectEqualStrings("/skills", app.skills.dir);
     try std.testing.expectEqualStrings("welcome\n", app.transcript.items);
     try std.testing.expect(app.transcript_recorded);

@@ -66,7 +66,7 @@ async function disablePromptHistory(
 ): Promise<void> {
   await session.sendText("/settings");
   await session.waitForText("←→ Change", TIMEOUT);
-  for (let index = 0; index < 13; index += 1) {
+  for (let index = 0; index < 14; index += 1) {
     await session.sendKeys("Down");
   }
   await session.sendKeys("Left");
@@ -240,6 +240,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
                   sandbox: false,
                   context: false,
                   session: false,
+                  workspace: false,
                   future: "keep-a-status",
                 },
                 future_workspace: { nested: "a" },
@@ -255,6 +256,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
                   sandbox: false,
                   context: false,
                   session: false,
+                  workspace: false,
                   future: "keep-b-status",
                 },
                 future_workspace: { nested: "b" },
@@ -294,6 +296,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("● Statusline: context:", TIMEOUT);
         await session.sendText("/statusline session");
         await session.waitForText("● Statusline: session:", TIMEOUT);
+        await session.sendText("/statusline workspace");
+        await session.waitForText("● Statusline: workspace:", TIMEOUT);
         await session.sendText("/settings startup-scrollback off");
         await session.waitForText("startup_scrollback: off", TIMEOUT);
         await disablePromptHistory(session, join(home, ".fx", "settings.json"));
@@ -312,6 +316,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           sandbox: true,
           context: true,
           session: true,
+          workspace: true,
         });
         expect(stored.future_global).toEqual({ nested: "preserve-me" });
         for (const [workspaceRoot, futureWorkspace, historyFuture, statusFuture] of [
@@ -325,7 +330,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           expect(override).not.toHaveProperty("fast_mode");
           expect(override).not.toHaveProperty("startup_scrollback");
           expect(override.prompt_history).toEqual({ future: historyFuture });
-          expect(override.statusLine).toEqual({ future: statusFuture });
+          expect(override.statusLine).toEqual({ workspace: false, future: statusFuture });
           expect(override.future_workspace).toEqual({ nested: futureWorkspace });
         }
         expect(readFileSync(join(workspaceA, ".fx.json"), "utf8")).toBe(projectABytes);
@@ -681,6 +686,74 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         session = null;
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test(
+    "configured effort and Fast are visible before model catalog resolves",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-startup-preferences-"));
+      let releaseCatalog: (() => void) | null = null;
+      const catalogRelease = new Promise<void>((resolve) => {
+        releaseCatalog = resolve;
+      });
+      const gateway = startFakeGateway([], {
+        models: async () => {
+          await catalogRelease;
+          return [{
+            id: "anthropic/claude-opus-4.8",
+            type: "language",
+            released: 1,
+            tags: ["fast", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
+            pricing: {
+              fast: { input: "0.1", output: "0.2" },
+            },
+          }];
+        },
+      });
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const stderrPath = join(root, "stderr.log");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          JSON.stringify({
+            model: "anthropic/claude-opus-4.8",
+            permission_mode: "auto",
+            effort: "xhigh",
+            fast_mode: true,
+          }) + "\n",
+          { mode: 0o600 },
+        );
+
+        session = await TmuxSession.create({
+          cwd: realpathSync(workspace),
+          env: {
+            ...NO_AUTH,
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          stderrPath,
+        });
+        const pane = await session.waitForText("auto · opus 4.8", TIMEOUT);
+        expect(pane).toContain("auto · opus 4.8 · xhigh · ⚡︎");
+        releaseCatalog?.();
+        releaseCatalog = null;
+
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(TIMEOUT);
+        session = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        releaseCatalog?.();
         gateway.stop();
         rmSync(root, { recursive: true, force: true });
       }
@@ -1410,6 +1483,50 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(statSync(join(home, ".fx", "history.lock")).mode & 0o777).toBe(0o600);
         expect(statSync(join(home, ".fx", "settings.json")).mode & 0o777).toBe(0o600);
         expect(statSync(join(home, ".fx", "settings.lock")).mode & 0o777).toBe(0o600);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  serialTest(
+    "workspace statusline stays active when user settings cannot be saved",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-statusline-write-failure-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace-write-failure-visible");
+        const settingsPath = join(home, ".fx", "settings.json");
+        const externalSettings = join(root, "external-settings.json");
+        const stderrPath = join(root, "stderr.log");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(settingsPath, '{"statusLine":{"workspace":false}}\n', { mode: 0o600 });
+        writeFileSync(externalSettings, '{"statusLine":{"workspace":false}}\n', { mode: 0o600 });
+
+        session = await TmuxSession.create({
+          cwd: realpathSync(workspace),
+          env: { ...NO_AUTH, HOME: home },
+          stderrPath,
+        });
+        await session.waitForText("Run /help", TIMEOUT);
+        expect(await session.capturePane()).not.toContain("workspace-write-failure-visible");
+
+        rmSync(settingsPath);
+        symlinkSync(externalSettings, settingsPath);
+        await session.sendText("/statusline workspace");
+        await session.waitForText("active for this process but not saved to user settings", TIMEOUT);
+        await session.waitForPane(
+          (pane) => pane.includes("workspace-write-failure-visible"),
+          TIMEOUT,
+        );
+        expect(JSON.parse(readFileSync(externalSettings, "utf8")).statusLine.workspace).toBe(false);
+
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(TIMEOUT);
+        session = null;
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         rmSync(root, { recursive: true, force: true });

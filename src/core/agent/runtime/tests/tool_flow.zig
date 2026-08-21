@@ -65,6 +65,8 @@ const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 
 const fixture_tools_json =
     "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
+const terminal_nested_tools_json =
+    "[{\"type\":\"function\",\"name\":\"terminal\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"request\":{\"oneOf\":[{\"type\":\"object\"}]}},\"required\":[\"request\"],\"additionalProperties\":false}}]";
 
 fn makeOwnedVisionCatalog(
     alloc: std.mem.Allocator,
@@ -494,7 +496,7 @@ fn expectPermissionDeniedToolResult(gateway: *const FakeGateway, index: usize, t
 fn expectedPermissionDeniedMessage(reason: types.ToolPermissionDenialReason) ?[]const u8 {
     return switch (reason) {
         .user_denied => "Permission denied by user",
-        .auto_denied => "Permission denied by auto mode classifier",
+        .auto_denied => "Blocked by automatic safety policy",
         .policy_denied, .permission_required => null,
     };
 }
@@ -1017,6 +1019,122 @@ test "accepted automatic review remains internal before ordinary tool execution"
     try std.testing.expect(
         !hooks.lifecycle_events.items[0].authoritative_started.place_after_current_transcript,
     );
+}
+
+test "borrowed nested terminal completion is flat before authority execution and memory" {
+    const alloc = std.testing.allocator;
+    const flat_arguments = "{\"action\":\"exec\",\"command\":\"printf done\"}";
+    const calls = [_]ToolCall{toolCall(
+        "call_nested_terminal",
+        "terminal",
+        "{\"request\":{\"action\":\"exec\",\"command\":\"printf done\"}}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{.once};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.gateway_tools_json = terminal_nested_tools_json;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("terminal", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.execute_authority_scopes.items.len);
+    try std.testing.expectEqualStrings(flat_arguments, hooks.last_validated_arguments.?);
+    try std.testing.expectEqualStrings(flat_arguments, hooks.last_permission_arguments.?);
+    try std.testing.expectEqualStrings(flat_arguments, hooks.last_executed_arguments.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqualStrings(
+        flat_arguments,
+        execution.tool_steps[0].tool_calls[0].arguments_json,
+    );
+}
+
+test "terminal lifecycle resolves one display target before execution" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall(
+        "inspect_call",
+        "terminal",
+        "{\"action\":\"inspect\",\"session_id\":\"terminal-cold-session\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_display_target = "session terminal-cold-session";
+    hooks.tool_display_target_after_execute = "npm run dev";
+    hooks.exec_plans = &.{.{ .result = .{
+        .status = .success,
+        .model_output = "{}",
+    } }};
+    const PermissionFixture = struct {
+        fn request(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: ToolCall,
+            _: permission_auto_classifier.ReviewTurnContext,
+            _: types.PermissionMode,
+            _: []const PermissionGrant,
+            _: ?runtime_tool_contracts.LiveToolAuthority,
+            _: ?runtime_tool_contracts.LivePermissionRevalidation,
+            _: []const []const u8,
+        ) !command_admission.PermissionOutcome {
+            return .{
+                .decision = .once,
+                .execution_authority = .ordinary,
+                .human_approval = .once,
+            };
+        }
+    };
+    var permission_fixture = PermissionFixture{};
+    hooks.permission_request_override = .{
+        .context = &permission_fixture,
+        .request_fn = PermissionFixture.request,
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.gateway_tools_json = terminal_nested_tools_json;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.tool_display_target_resolve_count);
+    var active_count: usize = 0;
+    var completed_count: usize = 0;
+    for (hooks.lifecycle_events.items) |event| switch (event) {
+        .progress => |progress| {
+            if (!std.mem.eql(u8, progress.id.call_id, "inspect_call")) continue;
+            try std.testing.expectEqualStrings(
+                "start terminal session terminal-cold-session",
+                progress.text,
+            );
+            active_count += 1;
+        },
+        .terminal => |terminal| {
+            if (!std.mem.eql(u8, terminal.id.call_id, "inspect_call")) continue;
+            try std.testing.expectEqualStrings(
+                "done terminal session terminal-cold-session",
+                terminal.outcome.summary,
+            );
+            completed_count += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), active_count);
+    try std.testing.expectEqual(@as(usize, 1), completed_count);
+    try std.testing.expectEqualStrings("npm run dev", hooks.tool_display_target.?);
 }
 
 test "automatic review does not reposition deferred web fetch lifecycle" {
@@ -4523,53 +4641,57 @@ test "processQueuedPrompt auto permission denial labels lifecycle source" {
     try expectPermissionDeniedToolResult(&gateway, 1, "write_file", .auto_denied);
 }
 
-test "three automatic permission blocks route the next action through approval" {
+test "four automatic permission blocks finish with a normal blocker" {
     const alloc = std.testing.allocator;
-    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
-    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
-    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch three\"}")};
-    const approved = [_]ToolCall{toolCall("approved-4", "run_command", "{\"command\":\"touch approved\"}")};
+    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch blocked\"}")};
+    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch blocked\"}")};
+    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch blocked\"}")};
+    const fourth = [_]ToolCall{toolCall("blocked-4", "run_command", "{\"command\":\"touch blocked\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &first },
         .{ .tool_calls = &second },
         .{ .tool_calls = &third },
-        .{ .tool_calls = &approved },
-        .{ .content = "Approved action completed." },
+        .{ .tool_calls = &fourth },
+        .{ .content = "must not be requested" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
-    hooks.permission_decisions = &.{ .deny, .deny, .deny, .once };
-    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied };
-    hooks.permission_human_approvals = &.{ .none, .none, .none, .once };
+    hooks.permission_decisions = &.{.deny};
+    hooks.permission_denial_reasons = &.{.auto_denied};
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.agent_step_limit = 5;
+    config.agent_step_limit = 0;
     config.gateway_tools_json = fixture_tools_json;
     var job = fixture.job();
     job.permission_mode = .auto;
 
     try runFakePrompt(&gateway, &hooks, config, job);
 
-    try std.testing.expectEqual(@as(usize, 5), gateway.request_bodies.items.len);
-    try expectBodyNotContains(&gateway, 3, "\"toolChoice\":{\"type\":\"none\"}");
-    try expectBodyNotContains(&gateway, 3, "\"tools\":[]");
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
     try std.testing.expectEqualStrings(
-        "Approved action completed.",
+        "I couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.",
         hooks.history_assistant_text.?,
     );
-    try std.testing.expectEqual(@as(usize, 4), hooks.permission_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.permission_names.items.len);
     try std.testing.expectEqualSlices(
         permission_auto_classifier.AutoPermissionPhase,
-        &.{ .automatic_review, .automatic_review, .automatic_review, .human_approval },
+        &.{.automatic_review},
         hooks.permission_review_phases.items,
     );
-    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
-    try std.testing.expectEqualStrings("run_command", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.texts.items.len);
+    try std.testing.expectEqualStrings(
+        "I couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.",
+        hooks.texts.items[0],
+    );
+    try std.testing.expectEqualStrings("\n", hooks.texts.items[1]);
 }
 
-test "human approval phase permits a normal text completion" {
+test "three automatic permission blocks still allow a normal text completion" {
     const alloc = std.testing.allocator;
     const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
     const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
@@ -4596,6 +4718,11 @@ test "human approval phase permits a normal text completion" {
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.permission_names.items.len);
+    try std.testing.expectEqualSlices(
+        permission_auto_classifier.AutoPermissionPhase,
+        &.{ .automatic_review, .automatic_review, .automatic_review },
+        hooks.permission_review_phases.items,
+    );
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings(
         "No further action is needed.",
@@ -4603,7 +4730,7 @@ test "human approval phase permits a normal text completion" {
     );
 }
 
-test "human approval phase reaches every call in a parallel response group" {
+test "a parallel fourth blocked group finishes with a normal blocker" {
     const alloc = std.testing.allocator;
     const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
     const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
@@ -4617,23 +4744,23 @@ test "human approval phase reaches every call in a parallel response group" {
         .{ .tool_calls = &second },
         .{ .tool_calls = &third },
         .{ .tool_calls = &parallel },
-        .{ .content = "Parallel approved actions completed." },
+        .{ .content = "must not be requested" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
-    hooks.permission_decisions = &.{ .deny, .deny, .deny, .once, .once };
-    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied };
-    hooks.permission_human_approvals = &.{ .none, .none, .none, .once, .once };
+    hooks.permission_decisions = &.{ .deny, .deny, .deny, .deny, .deny };
+    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied, .auto_denied, .auto_denied };
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.agent_step_limit = 5;
+    config.agent_step_limit = 0;
     var job = fixture.job();
     job.permission_mode = .auto;
 
     try runFakePrompt(&gateway, &hooks, config, job);
 
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 5), hooks.permission_names.items.len);
     try std.testing.expectEqualSlices(
         permission_auto_classifier.AutoPermissionPhase,
@@ -4641,12 +4768,16 @@ test "human approval phase reaches every call in a parallel response group" {
             .automatic_review,
             .automatic_review,
             .automatic_review,
-            .human_approval,
-            .human_approval,
+            .automatic_review,
+            .automatic_review,
         },
         hooks.permission_review_phases.items,
     );
-    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings(
+        "I couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.",
+        hooks.history_assistant_text.?,
+    );
 }
 
 test "three automatic permission blocks preserve an exhausted positive step cap" {
@@ -4677,6 +4808,39 @@ test "three automatic permission blocks preserve an exhausted positive step cap"
         runtime_config.Config.default_step_limit_notice,
         hooks.history_assistant_text.?,
     );
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+}
+
+test "four automatic permission blocks win over an exhausted positive step cap" {
+    const alloc = std.testing.allocator;
+    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
+    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
+    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch three\"}")};
+    const fourth = [_]ToolCall{toolCall("blocked-4", "run_command", "{\"command\":\"touch four\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first },
+        .{ .tool_calls = &second },
+        .{ .tool_calls = &third },
+        .{ .tool_calls = &fourth },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .deny, .deny, .deny, .deny };
+    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied, .auto_denied };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 4;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try std.testing.expectEqualStrings(
+        "I couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.",
+        hooks.history_assistant_text.?,
+    );
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 

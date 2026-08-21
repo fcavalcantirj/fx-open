@@ -27,6 +27,7 @@ const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const app_mcp_runtime = @import("app_mcp_runtime.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const sandbox = @import("../permissions/sandbox.zig");
@@ -332,6 +333,7 @@ pub fn Handlers(comptime App: type) type {
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
                 .show_models = commandShowModels,
+                .handle_provider = commandHandleProvider,
                 .handle_permissions = commandHandlePermissions,
                 .handle_allowlist = commandHandleAllowlist,
                 .show_stats = commandShowStats,
@@ -566,15 +568,28 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
-        fn commandLogout(ctx: *anyopaque) !void {
+        fn commandLogout(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "runLogoutCommand")) {
-                try app.runLogoutCommand();
+                try app.runLogoutCommand(rest);
             } else {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
                     .body = "logout is not available in this runtime",
+                }, true);
+            }
+        }
+
+        fn commandHandleProvider(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "runProviderCommand")) {
+                try app.runProviderCommand(rest);
+            } else {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "provider switching is not available in this runtime",
                 }, true);
             }
         }
@@ -1601,6 +1616,10 @@ pub fn Handlers(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             var snapshot = app.creditsProvider().fetch(app.alloc, .{
                 .credential = app.auth.apiKey(),
+                .credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
+                    app.auth.credentialSource()
+                else
+                    null,
                 .tenant = app.auth.gatewayTeam(),
             });
             defer snapshot.deinit(app.alloc);
@@ -1830,7 +1849,7 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try out.writer.print("version: {s} ({s})\n", .{ App.app_version, build_options.git_commit });
     try out.writer.print("platform: {s}/{s}\n", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
     try out.writer.print("build: {s}\n", .{@tagName(builtin.mode)});
-    try out.writer.print("model: {s}\n", .{app.selected_model.items});
+    try out.writer.print("model: {s}\n", .{provider_runtime.model(app)});
     if (app.fast_mode) try out.writer.writeAll("fast_mode: on\n");
     const perm_label = permissions.permissionModeLabel(app.permission_engine.mode);
     try out.writer.print("permission_mode: {s}\n", .{perm_label});
@@ -3165,74 +3184,89 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = msg }, true);
 }
 
-fn handleStatuslineCommand(app: anytype, rest: []const u8) !void {
-    const trimmed = std.mem.trim(u8, rest, " \t");
+const StatuslineFeedback = enum { announce, silent };
 
-    if (std.mem.eql(u8, trimmed, "sandbox")) {
-        app.statusline_sandbox = !app.statusline_sandbox;
-        const label: []const u8 = if (app.statusline_sandbox) "on" else "off";
-        persistStatuslineSetting(app, "sandbox", app.statusline_sandbox) catch |err| {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
-                "sandbox active for this process but not saved to user settings ({s})",
-                .{@errorName(err)},
-            );
-            defer app.alloc.free(notice);
-            try app.writeDomainNotice(.{ .topic = "statusline", .tone = .warning, .body = notice }, true);
-        };
-        const msg = try std.fmt.allocPrint(app.alloc, "sandbox: {s}", .{label});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "statusline", .tone = .neutral, .body = msg }, true);
-        return;
+fn parseStatuslineItem(raw: []const u8) ?config_runtime.StatuslineItem {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    inline for (std.meta.fields(config_runtime.StatuslineItem)) |field| {
+        if (std.mem.eql(u8, trimmed, field.name)) return @enumFromInt(field.value);
     }
-
-    if (std.mem.eql(u8, trimmed, "context")) {
-        app.statusline_context = !app.statusline_context;
-        const label: []const u8 = if (app.statusline_context) "on" else "off";
-        persistStatuslineSetting(app, "context", app.statusline_context) catch |err| {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
-                "context active for this process but not saved to user settings ({s})",
-                .{@errorName(err)},
-            );
-            defer app.alloc.free(notice);
-            try app.writeDomainNotice(.{ .topic = "statusline", .tone = .warning, .body = notice }, true);
-        };
-        const msg = try std.fmt.allocPrint(app.alloc, "context: {s}", .{label});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "statusline", .tone = .neutral, .body = msg }, true);
-        return;
-    }
-
-    if (std.mem.eql(u8, trimmed, "session")) {
-        app.statusline_session = !app.statusline_session;
-        const label: []const u8 = if (app.statusline_session) "on" else "off";
-        persistStatuslineSetting(app, "session", app.statusline_session) catch |err| {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
-                "session active for this process but not saved to user settings ({s})",
-                .{@errorName(err)},
-            );
-            defer app.alloc.free(notice);
-            try app.writeDomainNotice(.{ .topic = "statusline", .tone = .warning, .body = notice }, true);
-        };
-        const msg = try std.fmt.allocPrint(app.alloc, "session: {s}", .{label});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "statusline", .tone = .neutral, .body = msg }, true);
-        return;
-    }
-
-    try app.writeDomainNotice(.{ .topic = "statusline", .tone = .@"error", .body = "Use: sandbox, context, session" }, true);
+    return null;
 }
 
-fn persistStatuslineSetting(app: anytype, key: []const u8, value: bool) !void {
-    const item: config_runtime.UserSettingsPatch = if (std.mem.eql(u8, key, "sandbox"))
-        .{ .statusline_item = .{ .item = .sandbox, .enabled = value } }
-    else if (std.mem.eql(u8, key, "session"))
-        .{ .statusline_item = .{ .item = .session, .enabled = value } }
-    else
-        .{ .statusline_item = .{ .item = .context, .enabled = value } };
-    try persistUserPreferences(app, "statusline", item, true);
+fn statuslineItemForSetting(setting: settings_catalog.SettingId) ?config_runtime.StatuslineItem {
+    return switch (setting) {
+        .statusline_sandbox => .sandbox,
+        .statusline_context => .context,
+        .statusline_session => .session,
+        .statusline_workspace => .workspace,
+        else => null,
+    };
+}
+
+fn statuslineItemEnabled(app: anytype, item: config_runtime.StatuslineItem) bool {
+    const App = @TypeOf(app.*);
+    return switch (item) {
+        .sandbox => app.statusline_sandbox,
+        .context => app.statusline_context,
+        .session => app.statusline_session,
+        .workspace => if (comptime @hasField(App, "workspace_identity"))
+            app.workspace_identity.enabled
+        else
+            false,
+    };
+}
+
+fn assignStatuslineItem(app: anytype, item: config_runtime.StatuslineItem, enabled: bool) bool {
+    const App = @TypeOf(app.*);
+    const current = statuslineItemEnabled(app, item);
+    switch (item) {
+        .sandbox => app.statusline_sandbox = enabled,
+        .context => app.statusline_context = enabled,
+        .session => app.statusline_session = enabled,
+        .workspace => if (comptime @hasField(App, "workspace_identity")) {
+            app.workspace_identity.enabled = enabled;
+        },
+    }
+    return current != enabled;
+}
+
+fn applyStatuslineItem(
+    app: anytype,
+    item: config_runtime.StatuslineItem,
+    enabled: bool,
+    feedback: StatuslineFeedback,
+) !void {
+    const runtime_changed = assignStatuslineItem(app, item, enabled);
+    const patch: config_runtime.UserSettingsPatch = .{
+        .statusline_item = .{ .item = item, .enabled = enabled },
+    };
+    switch (feedback) {
+        .announce => {
+            try persistUserPreferences(app, "statusline", patch, runtime_changed);
+            const message = try std.fmt.allocPrint(
+                app.alloc,
+                "{s}: {s}",
+                .{ @tagName(item), if (enabled) "on" else "off" },
+            );
+            defer app.alloc.free(message);
+            try app.writeDomainNotice(.{ .topic = "statusline", .tone = .neutral, .body = message }, true);
+        },
+        .silent => try persistUserPreferencesSilently(app, "statusline", patch, runtime_changed),
+    }
+    app.shell.render_requests.request(.footer);
+}
+
+fn handleStatuslineCommand(app: anytype, rest: []const u8) !void {
+    const item = parseStatuslineItem(rest) orelse {
+        try app.writeDomainNotice(.{
+            .topic = "statusline",
+            .tone = .@"error",
+            .body = "Use: sandbox, context, session, workspace",
+        }, true);
+        return;
+    };
+    try applyStatuslineItem(app, item, !statuslineItemEnabled(app, item), .announce);
 }
 
 const SoundLevel = enum {
@@ -3326,11 +3360,11 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
 pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     const App = @TypeOf(app.*);
     var snapshot: settings_catalog.Snapshot = .{};
-    if (comptime @hasField(App, "selected_model")) snapshot.model = app.selected_model.items;
+    if (comptime provider_runtime.supported(App)) snapshot.model = provider_runtime.model(app);
     if (comptime @hasField(App, "effort")) snapshot.effort = app.effort.displayLabel();
     if (comptime @hasField(App, "fast_mode")) snapshot.fast_mode = app.fast_mode;
-    if (comptime @hasDecl(App, "resolvedModelCapabilities") and @hasField(App, "selected_model")) {
-        const capabilities = app.resolvedModelCapabilities(app.selected_model.items);
+    if (comptime @hasDecl(App, "resolvedModelCapabilities") and provider_runtime.supported(App)) {
+        const capabilities = app.resolvedModelCapabilities(provider_runtime.model(app));
         snapshot.reasoning_efforts = capabilities.reasoning_efforts;
         snapshot.supports_fast_mode = capabilities.supports_fast_mode;
     }
@@ -3350,6 +3384,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime @hasField(App, "statusline_sandbox")) snapshot.statusline_sandbox = app.statusline_sandbox;
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
+    if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
     if (comptime @hasField(App, "prompt_history")) snapshot.prompt_history = app.prompt_history.enabled;
     if (comptime @hasDecl(App, "notificationPreferences")) {
         const notifications = app.notificationPreferences();
@@ -3394,33 +3429,14 @@ pub fn applySettingsCatalogMenuChange(app: anytype, change: settings_catalog.Cha
                 runtime_changed,
             );
         },
-        .statusline_sandbox, .statusline_context, .statusline_session => {
+        .statusline_sandbox, .statusline_context, .statusline_session, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            const runtime_changed = switch (change.setting) {
-                .statusline_sandbox => blk: {
-                    const changed = enabled != app.statusline_sandbox;
-                    app.statusline_sandbox = enabled;
-                    break :blk changed;
-                },
-                .statusline_context => blk: {
-                    const changed = enabled != app.statusline_context;
-                    app.statusline_context = enabled;
-                    break :blk changed;
-                },
-                .statusline_session => blk: {
-                    const changed = enabled != app.statusline_session;
-                    app.statusline_session = enabled;
-                    break :blk changed;
-                },
-                else => unreachable,
-            };
-            const item: config_runtime.UserSettingsPatch = switch (change.setting) {
-                .statusline_sandbox => .{ .statusline_item = .{ .item = .sandbox, .enabled = enabled } },
-                .statusline_context => .{ .statusline_item = .{ .item = .context, .enabled = enabled } },
-                .statusline_session => .{ .statusline_item = .{ .item = .session, .enabled = enabled } },
-                else => unreachable,
-            };
-            try persistUserPreferencesSilently(app, "statusline", item, runtime_changed);
+            try applyStatuslineItem(
+                app,
+                statuslineItemForSetting(change.setting).?,
+                enabled,
+                .silent,
+            );
         },
         .sandbox => {
             const mode = sandbox.PublicMode.parse(change.value) orelse return error.InvalidSettingsCatalogValue;
@@ -3472,17 +3488,12 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         .model => unreachable,
         .input_appearance => try handleInputAppearanceCommand(app, change.value),
         .maxxing_mode => try handleMaxxingCommand(app, change.value),
-        .statusline_sandbox => {
+        .statusline_sandbox, .statusline_context, .statusline_session, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != app.statusline_sandbox) try handleStatuslineCommand(app, "sandbox");
-        },
-        .statusline_context => {
-            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != app.statusline_context) try handleStatuslineCommand(app, "context");
-        },
-        .statusline_session => {
-            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != app.statusline_session) try handleStatuslineCommand(app, "session");
+            const item = statuslineItemForSetting(change.setting).?;
+            if (enabled != statuslineItemEnabled(app, item)) {
+                try applyStatuslineItem(app, item, enabled, .announce);
+            }
         },
         .slash_menu_categories => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
@@ -3501,12 +3512,12 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         .effort => {
             const effort = types.ReasoningEffort.parseDisplayLabel(change.value) orelse
                 return error.InvalidSettingsCatalogValue;
-            const capabilities = app.resolvedModelCapabilities(app.selected_model.items);
+            const capabilities = app.resolvedModelCapabilities(provider_runtime.model(app));
             if (!model_capabilities.reasoningEffortSupported(capabilities, effort)) {
                 const message = try std.fmt.allocPrint(
                     app.alloc,
                     "{s} is not available for {s}",
-                    .{ effort.displayLabel(), app.selected_model.items },
+                    .{ effort.displayLabel(), provider_runtime.model(app) },
                 );
                 defer app.alloc.free(message);
                 try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);

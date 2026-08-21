@@ -6,6 +6,7 @@ const io_mod = @import("core/shared/io.zig");
 pub const version = "0.0.4";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
+const provider_runtime = @import("core/app/provider_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
 const api_key_validator = @import("core/auth/api_key_validator.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
@@ -41,6 +42,7 @@ const statusline_identity = @import("core/workspace/statusline_identity.zig");
 const collections = @import("core/shared/collections.zig");
 const agent_steps = @import("core/config/agent_steps.zig");
 const config_runtime = @import("core/config/config_runtime.zig");
+const model_provider = @import("core/config/model_provider.zig");
 const js_host_prompt_history = @import("core/session/js_host_prompt_history.zig");
 const model_capabilities = @import("core/config/model_capabilities.zig");
 const prompt_policy = @import("core/config/prompt_policy.zig");
@@ -49,7 +51,11 @@ const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_devbox = @import("builtins/devbox.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
+const builtin_providers = @import("builtins/providers.zig");
+const openai_codex_models = @import("gateway/openai_codex_models.zig");
+const openai_codex_permission_reviewer = @import("gateway/openai_codex_permission_reviewer.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
+const model_catalog = @import("core/gateway/model_catalog.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
@@ -77,6 +83,7 @@ const hooks = @import("core/hooks/hooks.zig");
 const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
+const subagent_agent_adapter = @import("core/subagent/agent_adapter.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
@@ -180,6 +187,7 @@ const idle_wasm_poll_timeout_ms: i32 = 16;
 const resize_debounce_ms: i64 = 100;
 const max_transcript_bytes: usize = 256 * 1024;
 const default_max_agent_steps: usize = agent_steps.default_max_agent_steps;
+const native_gateway_provider = builtin_gateway.provider;
 const max_history_turns: usize = 8;
 const max_list_entries: usize = 100;
 const max_read_file_bytes: usize = 50 * 1024;
@@ -427,11 +435,23 @@ const App = struct {
         return builtin_gateway.credits_provider;
     }
 
-    pub fn agentStreamProvider(_: *const Self) agent_stream_provider.Provider {
-        return if (comptime host_target.is_wasm)
-            js_host_stream_provider.provider()
-        else
-            builtin_gateway.agent_stream_provider;
+    pub fn agentStreamProvider(self: *const Self) agent_stream_provider.Provider {
+        return self.subagentProviderRoutes()
+            .select(self.provider_selection.selection().provider)
+            .agent_stream_provider;
+    }
+
+    pub fn fetchProviderCatalog(
+        self: *Self,
+        provider: model_provider.ProviderId,
+        access: credentials.CatalogAccess,
+    ) !model_catalog.ProviderResult {
+        return builtin_providers.modelCatalog(provider).fetch(self.alloc, .{
+            .access = access,
+            .endpoint = builtin_gateway.models_path,
+            .cancel_flag = &self.worker.worker_cancel_requested,
+            .view = .picker,
+        });
     }
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
@@ -477,7 +497,7 @@ const App = struct {
             oauth_transport.unavailable_provider,
         if (host_target.is_wasm) host.unavailable_secret_store else native_host.secret_store,
     ),
-    selected_model: std.ArrayList(u8) = .empty,
+    provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
@@ -562,6 +582,7 @@ const App = struct {
     pub fn init(alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !Self {
         var app = Self{
             .alloc = alloc,
+            .subagents = ui_subagents.Controller.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
             .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
                 background_process_provider.unavailable_provider
@@ -822,7 +843,7 @@ const App = struct {
         self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
-        self.selected_model.deinit(self.alloc);
+        self.provider_selection.deinit();
         self.session_title.deinit(self.alloc);
         SessionAppRuntime.deinitPersistence(self);
         if (self.requested_resume) |*target| {
@@ -914,8 +935,12 @@ const App = struct {
         try AuthAppRuntime.runLoginCommand(self);
     }
 
-    pub fn runLogoutCommand(self: *App) !void {
-        try AuthAppRuntime.runLogoutCommand(self);
+    pub fn runProviderCommand(self: *App, target: []const u8) !void {
+        try AuthAppRuntime.runProviderCommand(self, target);
+    }
+
+    pub fn runLogoutCommand(self: *App, target: []const u8) !void {
+        try AuthAppRuntime.runLogoutCommand(self, target);
     }
 
     pub fn applyAuthPickerChoice(self: *App, choice: auth_runtime.Choice) !void {
@@ -1247,7 +1272,7 @@ const App = struct {
         const prompt_copy = try std.heap.c_allocator.dupe(u8, prompt);
         errdefer std.heap.c_allocator.free(prompt_copy);
 
-        const model_copy = try std.heap.c_allocator.dupe(u8, self.selected_model.items);
+        const model_copy = try std.heap.c_allocator.dupe(u8, self.provider_selection.selection().model);
         errdefer std.heap.c_allocator.free(model_copy);
 
         const gateway_credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
@@ -1259,6 +1284,11 @@ const App = struct {
         else
             null;
         errdefer if (gateway_team_copy) |team| std.heap.c_allocator.free(team);
+        const account_id_copy = if (self.auth.accountId()) |account_id|
+            try std.heap.c_allocator.dupe(u8, account_id)
+        else
+            null;
+        errdefer if (account_id_copy) |account_id| std.heap.c_allocator.free(account_id);
 
         const authorized_image_catalog = try self.session.snapshotImageCatalog(
             std.heap.c_allocator,
@@ -1328,9 +1358,11 @@ const App = struct {
             .images = images_copy,
             .authorized_image_catalog = authorized_image_catalog,
             .model = model_copy,
+            .provider = self.provider_selection.selection().provider,
             .api_key = api_key_copy,
             .gateway_team = gateway_team_copy,
             .credential_source = gateway_credential.source,
+            .account_id = account_id_copy,
             .permission_mode = self.permission_engine.mode,
             .sandbox_backend = sandbox.effectiveBackend(
                 self.permission_engine.mode,
@@ -1525,7 +1557,7 @@ const App = struct {
         self: *App,
         admission: subagent_domain.AdmissionSnapshot,
     ) tool_runtime.Context {
-        return AgentAppRuntime.toolContextForSubagent(self, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, self.auth.gatewayChatUrl(builtin_gateway.default_chat_url), admission);
+        return AgentAppRuntime.toolContextForSubagent(self, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl(), admission);
     }
 
     pub fn runSubagentChild(
@@ -1550,36 +1582,67 @@ const App = struct {
         try self.permission_engine.allow(self.alloc, tool_name, target_path);
     }
 
-    pub fn permissionReviewerProvider(_: *const App) ?permission_auto_classifier.Provider {
-        return if (comptime host_profile.tools) builtin_gateway.permission_reviewer.provider else null;
+    pub fn permissionReviewerProvider(self: *const App) ?permission_auto_classifier.Provider {
+        return self.subagentProviderRoutes()
+            .select(self.provider_selection.selection().provider)
+            .permission_reviewer_provider;
     }
 
-    pub fn describeToolAction(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return AgentAppRuntime.describeToolAction(self, arena, call, file_display_path, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, self.auth.gatewayChatUrl(builtin_gateway.default_chat_url));
+    pub fn subagentProviderRoutes(_: *const App) subagent_agent_adapter.ProviderRoutes {
+        return .{
+            .gateway = .{
+                .agent_stream_provider = if (comptime host_target.is_wasm)
+                    js_host_stream_provider.provider()
+                else
+                    builtin_providers.agentStream(.gateway),
+                .permission_reviewer_provider = if (comptime host_profile.tools)
+                    builtin_gateway.permission_reviewer.provider
+                else
+                    null,
+            },
+            .codex = .{
+                .agent_stream_provider = if (comptime host_target.is_wasm)
+                    agent_stream_provider.unavailable_provider
+                else
+                    builtin_providers.agentStream(.codex),
+                .permission_reviewer_provider = if (comptime host_profile.tools and !host_target.is_wasm)
+                    openai_codex_permission_reviewer.provider
+                else
+                    null,
+            },
+        };
     }
 
-    pub fn describeToolActionWithAdvertised(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return self.describeToolAction(arena, call, file_display_path, advertised_dynamic_tool_names);
+    pub fn describeToolAction(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return AgentAppRuntime.describeToolAction(self, arena, call, display_target, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
-    pub fn describeToolActionCompleted(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return AgentAppRuntime.describeToolActionCompleted(self, arena, call, file_display_path, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, self.auth.gatewayChatUrl(builtin_gateway.default_chat_url));
+    pub fn resolveToolActionDisplayTarget(self: *App, arena: Allocator, call: ToolCall) !?[]const u8 {
+        return AgentAppRuntime.resolveToolActionDisplayTarget(self, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
-    pub fn describeToolActionCompletedWithAdvertised(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return self.describeToolActionCompleted(arena, call, file_display_path, advertised_dynamic_tool_names);
+    pub fn describeToolActionWithAdvertised(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return self.describeToolAction(arena, call, display_target, advertised_dynamic_tool_names);
     }
 
-    pub fn describeToolActionDenied(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return AgentAppRuntime.describeToolActionDenied(self, arena, call, file_display_path, label, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, self.auth.gatewayChatUrl(builtin_gateway.default_chat_url));
+    pub fn describeToolActionCompleted(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return AgentAppRuntime.describeToolActionCompleted(self, arena, call, display_target, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
-    pub fn describeToolActionDeniedWithAdvertised(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return self.describeToolActionDenied(arena, call, file_display_path, label, advertised_dynamic_tool_names);
+    pub fn describeToolActionCompletedWithAdvertised(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return self.describeToolActionCompleted(arena, call, display_target, advertised_dynamic_tool_names);
+    }
+
+    pub fn describeToolActionDenied(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return AgentAppRuntime.describeToolActionDenied(self, arena, call, display_target, label, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    }
+
+    pub fn describeToolActionDeniedWithAdvertised(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return self.describeToolActionDenied(arena, call, display_target, label, advertised_dynamic_tool_names);
     }
 
     pub fn requestToolPermissionSync(self: *App, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
-        return AgentAppRuntime.requestToolPermissionSync(self, arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, self.auth.gatewayChatUrl(builtin_gateway.default_chat_url));
+        return AgentAppRuntime.requestToolPermissionSync(self, arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn requestToolPermissionSyncWithAdvertised(self: *App, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
@@ -1587,7 +1650,7 @@ const App = struct {
     }
 
     pub fn requestPreparedFileMutationPermissionSyncWithAdvertised(self: *App, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
-        return AgentAppRuntime.requestPreparedFileMutationPermissionSync(self, arena, call, prepared, review_turn, permission_mode, local_grants, live_authority, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, self.auth.gatewayChatUrl(builtin_gateway.default_chat_url));
+        return AgentAppRuntime.requestPreparedFileMutationPermissionSync(self, arena, call, prepared, review_turn, permission_mode, local_grants, live_authority, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn requestSandboxWideningSyncWithAdvertised(
@@ -1618,20 +1681,20 @@ const App = struct {
             max_read_file_line_len,
             max_command_output_bytes,
             builtin_gateway.retry_count,
-            self.auth.gatewayChatUrl(builtin_gateway.default_chat_url),
+            builtin_gateway.defaultChatUrl(),
         );
     }
 
     pub fn validateToolCall(self: *App, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
-        return AgentAppRuntime.validateToolCall(self, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, self.auth.gatewayChatUrl(builtin_gateway.default_chat_url));
+        return AgentAppRuntime.validateToolCall(self, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn checkToolAvailability(self: *App, arena: Allocator, call: ToolCall) !?[]const u8 {
-        return AgentAppRuntime.checkToolAvailability(self, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, self.auth.gatewayChatUrl(builtin_gateway.default_chat_url));
+        return AgentAppRuntime.checkToolAvailability(self, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn permissionTargetForCall(self: *App, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return AgentAppRuntime.permissionTargetForCall(self, arena, call, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, self.auth.gatewayChatUrl(builtin_gateway.default_chat_url));
+        return AgentAppRuntime.permissionTargetForCall(self, arena, call, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn permissionTargetForCallWithAdvertised(self: *App, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -1652,7 +1715,7 @@ const App = struct {
             max_read_file_line_len,
             max_command_output_bytes,
             builtin_gateway.retry_count,
-            self.auth.gatewayChatUrl(builtin_gateway.default_chat_url),
+            builtin_gateway.defaultChatUrl(),
         );
         return tool_admission.preparePermissionStateAction(
             ctx.admissionInput(),
@@ -1686,7 +1749,10 @@ const App = struct {
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
         return AgentAppRuntime.fetchModelIds(
             self,
-            if (comptime host_target.is_wasm) js_host_model_catalog.provider else builtin_gateway.model_catalog_provider,
+            if (comptime host_target.is_wasm)
+                js_host_model_catalog.provider
+            else
+                builtin_providers.modelCatalog(self.provider_selection.selection().provider),
             builtin_gateway.models_path,
         );
     }
@@ -1703,7 +1769,7 @@ const App = struct {
             );
         } else {
             self.model_cache.startWarmup(
-                builtin_gateway.model_catalog_provider,
+                builtin_providers.modelCatalog(self.provider_selection.selection().provider),
                 self.auth.modelCatalogAccess(),
             );
         }
@@ -1821,7 +1887,7 @@ const App = struct {
             self,
             job,
             builtin_gateway.retry_count,
-            self.auth.gatewayChatUrl(builtin_gateway.default_chat_url),
+            builtin_gateway.defaultChatUrl(),
         ) catch |err| {
             if (err == error.TurnFinalizationDeliveryFailed) return;
             return err;
@@ -1837,7 +1903,7 @@ const App = struct {
                 return agent_runtime.unavailableHostToolResult(request.result_allocator);
             }
         }
-        return AgentAppRuntime.executeToolCall(self, request, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, self.auth.gatewayChatUrl(builtin_gateway.default_chat_url));
+        return AgentAppRuntime.executeToolCall(self, request, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn executeToolCallWithAdvertised(self: *App, request: agent_runtime.ToolExecutionRequest) !ToolExecutionResult {
@@ -1850,11 +1916,11 @@ const App = struct {
     }
 
     pub fn appendRuntimeContextMessage(self: *App, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
-        try AgentAppRuntime.appendTransientRuntimeContextMessage(self, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, self.auth.gatewayChatUrl(builtin_gateway.default_chat_url));
+        try AgentAppRuntime.appendTransientRuntimeContextMessage(self, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn appendStaticContextMessage(self: *App, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
-        try AgentAppRuntime.appendStaticContextMessage(self, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, self.auth.gatewayChatUrl(builtin_gateway.default_chat_url));
+        try AgentAppRuntime.appendStaticContextMessage(self, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     fn runtimeContextSnapshot(self: *App, alloc: Allocator) !RuntimeContextSnapshot {
@@ -3091,6 +3157,7 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
     return std.mem.eql(u8, command, "login") or
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
+        std.mem.eql(u8, command, "provider") or
         std.mem.eql(u8, command, "setup") or
         std.mem.eql(u8, command, "upgrade") or
         // Resolve a stored credential, which reads the platform key store out of process.
@@ -3107,6 +3174,7 @@ test "auth and upgrade commands use early threaded io without full entry config"
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "login")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "logout")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "teams")}));
+    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "provider")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "setup")}));
 }
 
@@ -3200,7 +3268,10 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = native_gateway_provider,
+        .codex_agent_stream = builtin_providers.agentStream(.codex),
+        .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
+        .codex_model_catalog = openai_codex_models.model_catalog_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3222,6 +3293,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .acp_runner = .{ .run_fn = runAcpServer },
         .devbox_provider = builtin_devbox.provider,
         .permission_reviewer_provider = builtin_gateway.permission_reviewer.provider,
+        .codex_permission_reviewer_provider = openai_codex_permission_reviewer.provider,
     };
 }
 
@@ -3236,7 +3308,10 @@ fn localEntryConfig() app_entry_runtime.Config {
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = native_gateway_provider,
+        .codex_agent_stream = builtin_providers.agentStream(.codex),
+        .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
+        .codex_model_catalog = openai_codex_models.model_catalog_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3271,7 +3346,10 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .models_path = "",
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = native_gateway_provider,
+        .codex_agent_stream = builtin_providers.agentStream(.codex),
+        .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
+        .codex_model_catalog = openai_codex_models.model_catalog_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3709,6 +3787,8 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 
 test {
     _ = @import("napi_fetch_state.zig");
+    _ = @import("core/config/model_provider.zig");
+    _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("core/output/activity_status.zig");
     _ = @import("core/agent/agent_runtime.zig");
@@ -3758,6 +3838,7 @@ test {
     _ = @import("core/slash_commands/command_router.zig");
     _ = @import("core/slash_commands/command_specs.zig");
     _ = @import("core/config/config_runtime.zig");
+    _ = @import("core/config/settings_store.zig");
     _ = @import("ui/footer/appearance_menu_presentation.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
     _ = @import("ui/footer/settings_menu_presentation.zig");
@@ -3769,6 +3850,12 @@ test {
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/auth/login_flow.zig");
+    _ = @import("core/auth/chatgpt_oauth.zig");
+    _ = @import("core/auth/provider_catalog.zig");
+    _ = @import("gateway/openai_codex_models.zig");
+    _ = @import("gateway/openai_codex.zig");
+    _ = @import("gateway/openai_codex_permission_reviewer.zig");
+    _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/workspace/file_index.zig");
@@ -3844,6 +3931,9 @@ test {
     _ = @import("core/terminal/host.zig");
     _ = @import("core/terminal/tmux_session.zig");
     _ = @import("core/terminal/client.zig");
+    _ = @import("core/terminal/direct_runtime.zig");
+    _ = @import("core/app/app_terminal_runtime.zig");
+    _ = @import("tools/terminal/terminal.zig");
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/tasks/task_helpers.zig");

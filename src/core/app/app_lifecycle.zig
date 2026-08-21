@@ -6,9 +6,9 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
-const openai_transport = @import("../gateway/openai_transport.zig");
 const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -122,6 +122,7 @@ pub const StartupState = struct {
     credential: ?credentials.Credential = null,
     credential_onboarding_skipped: bool = false,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
+    provider: model_provider.ProviderId = .gateway,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
     model_source: config_runtime.ModelSource = .compiled_default,
@@ -148,11 +149,11 @@ pub const StartupState = struct {
     statusline_sandbox: bool = false,
     statusline_context: bool = false,
     statusline_session: bool = false,
+    statusline_workspace: bool = false,
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
-    transport_route: openai_transport.TransportRoute = .{},
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
         self.workspace_access.deinit(alloc);
@@ -165,7 +166,6 @@ pub const StartupState = struct {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
             alloc.free(self.config_diagnostics);
         }
-        self.transport_route.deinit(alloc);
         self.* = .{ .agent_step_limit = self.agent_step_limit };
     }
 
@@ -197,18 +197,6 @@ pub const StartupState = struct {
         return credential.gatewayTeam();
     }
 
-    pub fn gatewayChatUrl(self: *const StartupState, gateway_fallback: []const u8) []const u8 {
-        const base = self.transport_route.chatUrl(gateway_fallback);
-        return openai_transport.resolveGatewayChatUrl(
-            base,
-            io_mod.getenv(openai_transport.gateway_chat_url_env),
-        );
-    }
-
-    pub fn gatewayWireKind(self: *const StartupState) openai_transport.WireKind {
-        return self.transport_route.wire_kind;
-    }
-
     pub fn takeCredential(self: *StartupState) ?credentials.Credential {
         const value = self.credential;
         self.credential = null;
@@ -230,6 +218,7 @@ pub const StartupState = struct {
 
 pub const StartupStatus = struct {
     workspace_root: []u8,
+    provider: model_provider.ProviderId = .gateway,
     selected_model: []const u8,
     owned_selected_model: ?[]u8 = null,
     auth: auth_runtime.StatusSnapshot = .{},
@@ -332,14 +321,21 @@ pub fn loadStartupStatus(
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
 
-    const selected_model = try loadStartupStatusModel(alloc, default_model, settings.model);
+    const configured_selection = try configuredProviderSelection(default_model, settings);
+    const selected_model = try loadStartupStatusModel(alloc, configured_selection.model, null);
     errdefer if (selected_model.owned) |model| alloc.free(model);
 
-    var auth_status = try auth_runtime.loadStatusSnapshot(alloc, secret_store, settings.credential_source);
+    var auth_status = try auth_runtime.loadStatusSnapshotForProvider(
+        alloc,
+        secret_store,
+        configured_selection.provider,
+        settings.credential_source,
+    );
     errdefer auth_status.deinit(alloc);
 
     const result = StartupStatus{
         .workspace_root = workspace_root,
+        .provider = configured_selection.provider,
         .selected_model = selected_model.value,
         .owned_selected_model = selected_model.owned,
         .auth = auth_status,
@@ -396,13 +392,6 @@ fn loadStartupStateFromOwnedWorkspace(
         try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
-    if (!openai_transport.configureProfileBaseUrl(settings.openai_base_url)) {
-        debug_trace.logf("config", "openai_base_url exceeds 512-byte limit; ignored", .{});
-    }
-    if (!openai_transport.configureProfileApiKey(settings.openai_api_key)) {
-        debug_trace.logf("config", "openai_api_key exceeds 512-byte limit; ignored", .{});
-    }
-    openai_transport.configureProfileApiStyle(settings.openai_api_style);
 
     state.workspace_access = try workspace_access.WorkspaceAccess.init(
         alloc,
@@ -412,30 +401,26 @@ fn loadStartupStateFromOwnedWorkspace(
         false,
     );
 
-    state.configured_model = try alloc.dupe(u8, settings.model orelse default_model);
+    const configured_selection = try configuredProviderSelection(default_model, settings);
+    state.provider = configured_selection.provider;
+    state.configured_model = try alloc.dupe(u8, configured_selection.model);
     state.model_source = detailed.model_source orelse .compiled_default;
-    state.selected_model = try loadInitialModel(alloc, default_model, settings.model);
+    state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);
     if (hasProcessModelOverride()) state.model_source = .process_override;
     state.config_diagnostics = detailed.diagnostics;
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     if (credential_mode) |mode| {
-        const resolution = try credentials.resolvePreferring(alloc, transport, secret_store, mode, settings.credential_source);
-        if (resolution.credential) |credential| {
-            state.credential = credential;
-        } else if (settings.openai_api_key) |profile_key| {
-            const trimmed = std.mem.trim(u8, profile_key, " \t\r\n");
-            if (trimmed.len > 0) {
-                state.credential = .{
-                    .token = try alloc.dupe(u8, trimmed),
-                    .source = .openai_api_key,
-                };
-            }
-        }
-        if (state.credential) |credential| {
-            state.transport_route = try openai_transport.buildTransportRoute(alloc, credential.source);
-        }
+        const resolution = try credentials.resolveForProvider(
+            alloc,
+            transport,
+            secret_store,
+            mode,
+            state.provider,
+            settings.credential_source,
+        );
+        state.credential = resolution.credential;
         state.stored_key_status = resolution.stored_key_status;
     }
     state.permission_mode = loadPermissionMode(settings.permission_mode);
@@ -458,13 +443,13 @@ fn loadStartupStateFromOwnedWorkspace(
     state.statusline_sandbox = settings.statusline_sandbox orelse false;
     state.statusline_context = settings.statusline_context orelse false;
     state.statusline_session = settings.statusline_session orelse false;
+    state.statusline_workspace = settings.statusline_workspace orelse false;
     const sound_override = soundEnvOverride();
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;
     const max_override: ?bool = if (sound_override) |level| level == .max else null;
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
-    state.credential_onboarding_skipped = credentialOnboardingDisabled(settings);
 
     return state;
 }
@@ -485,6 +470,8 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.default_agent_step_limit,
     );
     errdefer state.deinit(cfg.alloc);
+
+    state.credential_onboarding_skipped = credentialOnboardingDisabled();
 
     errdefer shutdownInteractiveShell(
         cfg.terminal,
@@ -1127,10 +1114,48 @@ fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
     );
 }
 
+fn configuredProviderSelection(
+    default_model: []const u8,
+    settings: *const config_runtime.Settings,
+) !model_provider.ProviderSelection {
+    const provider = settings.provider orelse .gateway;
+    const model = switch (provider) {
+        .gateway => settings.model orelse default_model,
+        .codex => settings.codex_model orelse return error.CodexModelNotSelected,
+    };
+    return .{ .provider = provider, .model = model };
+}
+
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
     const model = io_mod.getenv("FX_MODEL") orelse return configured orelse default_model;
     const trimmed = std.mem.trim(u8, model, " \t\r\n");
     return if (trimmed.len > 0) trimmed else configured orelse default_model;
+}
+
+test "startup provider chooses only its provider-scoped model" {
+    const gateway_settings = config_runtime.Settings{
+        .model = @constCast("gateway/model"),
+        .provider = .gateway,
+        .codex_model = @constCast("gpt-model"),
+    };
+    const gateway = try configuredProviderSelection("default/model", &gateway_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.provider);
+    try std.testing.expectEqualStrings("gateway/model", gateway.model);
+
+    const codex_settings = config_runtime.Settings{
+        .model = @constCast("gateway/model"),
+        .provider = .codex,
+        .codex_model = @constCast("gpt-model"),
+    };
+    const codex = try configuredProviderSelection("default/model", &codex_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
+    try std.testing.expectEqualStrings("gpt-model", codex.model);
+
+    const missing_codex = config_runtime.Settings{ .provider = .codex };
+    try std.testing.expectError(
+        error.CodexModelNotSelected,
+        configuredProviderSelection("default/model", &missing_codex),
+    );
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
@@ -1165,18 +1190,7 @@ fn loadStartupStatusModel(alloc: Allocator, default_model: []const u8, configure
     return .{ .value = owned, .owned = owned };
 }
 
-fn credentialOnboardingDisabled(settings: *const config_runtime.Settings) bool {
-    if (credentialOnboardingDisabledFromEnv()) return true;
-    if (settings.openai_api_key) |key| {
-        if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
-    }
-    return false;
-}
-
-fn credentialOnboardingDisabledFromEnv() bool {
-    if (io_mod.getenv("OPENAI_API_KEY")) |raw| {
-        if (std.mem.trim(u8, raw, " \t\r\n").len > 0) return true;
-    }
+fn credentialOnboardingDisabled() bool {
     const value = io_mod.getenv("FX_SKIP_ONBOARDING") orelse return false;
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len == 0) return false;
@@ -2277,7 +2291,7 @@ test "credential onboarding can be skipped independently from Keychain" {
     });
     defer env.deinit();
 
-    const onboarding_skipped = credentialOnboardingDisabledFromEnv();
+    const onboarding_skipped = credentialOnboardingDisabled();
     try std.testing.expect(onboarding_skipped);
 }
 
