@@ -40,7 +40,7 @@ fx login codex
 fx
 ```
 
-Inside fx, `/provider` switches between Gateway, Codex, and OpenAI-compatible, and `/model` lists the active provider's fetched models. Codex model IDs are the raw IDs returned by its authenticated catalog. Use `/logout codex` to remove the Codex session without affecting Vercel access.
+`fx login codex` selects Codex and a model from its authenticated catalog. Use `/logout codex` to remove the Codex session without affecting Vercel access.
 
 To use a direct OpenAI or OpenAI-compatible API instead of Vercel AI Gateway, set `OPENAI_API_KEY` (or `LITELLM_API_KEY` for LiteLLM proxies) and optionally configure the endpoint in `~/.fx/settings.json`:
 
@@ -53,9 +53,20 @@ To use a direct OpenAI or OpenAI-compatible API instead of Vercel AI Gateway, se
 }
 ```
 
-Use `openai_api_style` `responses` for servers that expose the OpenAI Responses API instead of Chat Completions. When Gateway credentials are absent and an OpenAI key is configured, fx auto-selects the OpenAI-compatible provider. Run `fx provider openai` or `/provider openai` to switch explicitly.
+Use `openai_api_style` `responses` for servers that expose the OpenAI Responses API instead of Chat Completions. When Gateway credentials are absent and an OpenAI key is configured, fx auto-selects the OpenAI-compatible provider. Run `fx provider openai` to switch explicitly.
+
+Or use an eligible Grok subscription through xAI OAuth:
+
+```bash
+fx login grok
+fx
+```
+
+`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, open `/setup` and choose **Switch provider** to move between Gateway, Codex, Grok, and OpenAI-compatible. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing it again from **Switch provider** starts sign-in.
 
 The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
+
+The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
 
 To use an AI Gateway API key instead:
 

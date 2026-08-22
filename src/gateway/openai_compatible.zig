@@ -187,6 +187,7 @@ fn streamCompletionCore(
             return error.OpenAiApiKeyCredentialRequired;
         }) {
             .chatgpt_subscription => error.CodexSubscriptionCredentialRequired,
+            .grok_subscription => error.OpenAiCredentialCannotAuthorizeGateway,
             .ai_gateway_api_key, .vercel_oidc_token, .fx_login, .stored_key => error.OpenAiCredentialCannotAuthorizeGateway,
             .openai_api_key => unreachable,
         };
@@ -357,6 +358,7 @@ fn streamResponsesCompletion(
         request.on_tool_input_chunk,
         request.cancel_flag,
         request.content_capture_limit,
+        .{},
     );
     return .{
         .status = .ok,

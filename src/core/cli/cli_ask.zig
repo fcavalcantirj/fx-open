@@ -13,7 +13,6 @@ const terminal_client_runtime = @import("../terminal/client.zig");
 const background_store = @import("../background/background_store.zig");
 const process_supervisor = @import("../background/process_supervisor.zig");
 const context_contract = @import("../workspace/context_contract.zig");
-const devbox_executor = @import("../execution/devbox_executor.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const openai_compatible = @import("../../gateway/openai_compatible.zig");
 const openai_transport = @import("../gateway/openai_transport.zig");
@@ -47,7 +46,6 @@ const auto_classifier_context = @import("../permissions/auto_classifier_context.
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_usage = @import("../session/session_usage.zig");
@@ -228,6 +226,8 @@ pub const Config = struct {
     gateway_provider: gateway_provider.Provider,
     codex_agent_stream: ?agent_stream_provider.Provider = null,
     codex_model_catalog: ?model_catalog.Provider = null,
+    grok_agent_stream: ?agent_stream_provider.Provider = null,
+    grok_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,
@@ -243,9 +243,10 @@ pub const Config = struct {
     max_history_turns: usize,
     mode_registry: mode_registry.Registry,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
-    devbox_provider: ?devbox_executor.Provider = null,
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    openai_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
@@ -285,7 +286,14 @@ fn runAskChild(
             },
             .openai = .{
                 .agent_stream_provider = ctx.agentStreamProvider(),
-                .permission_reviewer_provider = ctx.cfg.permission_reviewer_provider,
+                .permission_reviewer_provider = if (ctx.cfg.openai_permission_reviewer_provider) |reviewer| .{
+                    .context = @ptrCast(@alignCast(@constCast(&ctx.openai_config))),
+                    .review_fn = reviewer.review_fn,
+                } else null,
+            },
+            .grok = .{
+                .agent_stream_provider = ctx.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
+                .permission_reviewer_provider = ctx.cfg.grok_permission_reviewer_provider,
             },
         },
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
@@ -542,7 +550,6 @@ const AskContext = struct {
     mode_id: []const u8,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
-    sandbox_backend: sandbox.BackendKind = .none,
     worker: WorkerRuntime = .{},
     use_process_interrupt_flag: bool = false,
     background: BackgroundRuntime = .{},
@@ -1018,8 +1025,6 @@ const AskContext = struct {
                 null,
             .terminal_client = &self.terminal_client,
             .command_timeout_ms = self.command_timeout_ms,
-            .sandbox_backend = self.sandbox_backend,
-            .devbox_provider = self.cfg.devbox_provider,
             .web_fetch_runtime = &self.web_fetch_runtime,
             .web_fetch_artifact_store = self.session.webFetchArtifactStore(),
             .web_fetch_artifact_error = self.session.webFetchArtifactError(),
@@ -1071,11 +1076,19 @@ const AskContext = struct {
         const provider = switch (self.provider) {
             .gateway => self.cfg.permission_reviewer_provider,
             .codex => self.cfg.codex_permission_reviewer_provider,
-            .openai => self.cfg.permission_reviewer_provider,
+            .openai => blk: {
+                const reviewer = self.cfg.openai_permission_reviewer_provider orelse break :blk null;
+                break :blk permission_auto_classifier.Provider{
+                    .context = @ptrCast(@alignCast(@constCast(&self.openai_config))),
+                    .review_fn = reviewer.review_fn,
+                };
+            },
+            .grok => self.cfg.grok_permission_reviewer_provider,
         } orelse
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = self.api_key,
+            .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.cfg.gateway_chat_url,
             .cancel_flag = self.cancelFlag(),
@@ -1093,6 +1106,7 @@ const AskContext = struct {
                 .build_fn = openai_compatible.agent_stream_provider.build_fn,
                 .stream_fn = openai_compatible.agent_stream_provider.stream_fn,
             },
+            .grok => self.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
         };
     }
 
@@ -1188,6 +1202,13 @@ fn writeAskUsage(deps: RunDeps, usage: []const u8) !void {
     try deps.write_stderr(deps.stderr_ctx, "usage: fx ");
     try deps.write_stderr(deps.stderr_ctx, usage);
     try deps.write_stderr(deps.stderr_ctx, "\n");
+}
+
+fn askErrorNotice(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.ImagePreparationFailed => image_attachments.image_preparation_failed_notice,
+        else => null,
+    };
 }
 
 fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !u8 {
@@ -1302,7 +1323,13 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
             );
             return 1;
         }
-        if (!options.json_output) return err;
+        if (!options.json_output) {
+            const notice = askErrorNotice(err) orelse return err;
+            try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
+            try deps.write_stderr(deps.stderr_ctx, notice);
+            try deps.write_stderr(deps.stderr_ctx, "\n");
+            return 1;
+        }
         const json = try renderErrorJsonResult(alloc, @errorName(err));
         defer alloc.free(json);
         try deps.write_stdout(deps.stdout_ctx, json);
@@ -1399,11 +1426,7 @@ fn missingCredentialResult(
     options: RunOptions,
     provider: model_provider.ProviderId,
 ) !PromptRunResult {
-    const message = switch (provider) {
-        .codex => credentials.missing_chatgpt_credential_message,
-        .openai => credentials.missing_openai_credential_message,
-        .gateway => credentials.missing_credential_message,
-    };
+    const message = credentials.missingCredentialMessage(provider, false);
     try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
     try options.deps.write_stderr(options.deps.stderr_ctx, message);
     try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
@@ -1502,10 +1525,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.permission_mode = permission_mode;
     ctx.mode_id = mode_id;
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
-    ctx.sandbox_backend = sandbox.effectiveBackend(
-        ctx.permission_mode,
-        toCoreSandbox(startup.sandbox_backend),
-    );
     ctx.context_enabled = startup.context_enabled;
     if (options.output_mode.isTerminal()) {
         presenter = try ask_presentation.Runtime.init(alloc, .{
@@ -1574,7 +1593,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.gateway_team = credential.gatewayTeam();
     ctx.credential_source = credential.source;
     ctx.account_id = credential.accountId();
-    ctx.model_catalog_access = credentials.catalogAccessForCredential(credential.source, api_key, credential.gatewayTeam());
+    ctx.model_catalog_access = credentials.catalogAccessForCredentialAndAccount(
+        credential.source,
+        api_key,
+        credential.gatewayTeam(),
+        credential.accountId(),
+    );
 
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
@@ -1705,7 +1729,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .account_id = if (credential.accountId()) |account_id| @constCast(account_id) else null,
         .provider = ctx.provider,
         .permission_mode = ctx.permission_mode,
-        .sandbox_backend = ctx.sandbox_backend,
         .history = context_history,
         .root_user_intent_context = root_user_intent_context,
         .grants = &.{},
@@ -1895,7 +1918,6 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
-        .request_sandbox_widening = requestSandboxWideningForRuntime,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
         .describe_tool_action = describeToolAction,
         .describe_tool_action_completed = describeToolActionCompleted,
@@ -2009,6 +2031,7 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
         ctx.provider,
         ctx.cfg.gateway_provider.model_catalog,
         ctx.cfg.codex_model_catalog,
+        ctx.cfg.grok_model_catalog,
     ) orelse return model_capabilities.capabilitiesForModel(model);
     return ctx.capability_resolver.resolve(
         ctx.alloc,
@@ -2026,11 +2049,13 @@ fn selectModelCatalog(
     provider: model_provider.ProviderId,
     gateway: model_catalog.Provider,
     codex: ?model_catalog.Provider,
+    grok: ?model_catalog.Provider,
 ) ?model_catalog.Provider {
     return switch (provider) {
         .gateway => gateway,
         .codex => codex,
         .openai => null,
+        .grok => grok,
     };
 }
 
@@ -2046,18 +2071,24 @@ test "provider catalog selection never falls back across origins" {
     gateway.context = &gateway_tag;
     var codex = test_builtin_gateway.model_catalog_provider;
     codex.context = &codex_tag;
+    var grok_tag: u8 = 0;
+    var grok = test_builtin_gateway.model_catalog_provider;
+    grok.context = &grok_tag;
     const cases = [_]struct {
         provider: model_provider.ProviderId,
         codex: ?model_catalog.Provider,
+        grok: ?model_catalog.Provider,
         expected_context: ?*anyopaque,
     }{
-        .{ .provider = .gateway, .codex = codex, .expected_context = &gateway_tag },
-        .{ .provider = .codex, .codex = codex, .expected_context = &codex_tag },
-        .{ .provider = .codex, .codex = null, .expected_context = null },
+        .{ .provider = .gateway, .codex = codex, .grok = grok, .expected_context = &gateway_tag },
+        .{ .provider = .codex, .codex = codex, .grok = grok, .expected_context = &codex_tag },
+        .{ .provider = .codex, .codex = null, .grok = grok, .expected_context = null },
+        .{ .provider = .grok, .codex = codex, .grok = grok, .expected_context = &grok_tag },
+        .{ .provider = .grok, .codex = codex, .grok = null, .expected_context = null },
     };
 
     for (cases) |case| {
-        const selected = selectModelCatalog(case.provider, gateway, case.codex);
+        const selected = selectModelCatalog(case.provider, gateway, case.codex, case.grok);
         if (case.expected_context) |expected| {
             try std.testing.expect(selected != null);
             try std.testing.expect(selected.?.context.? == expected);
@@ -2083,7 +2114,6 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
-        .sandbox_backend = ctx.sandbox_backend,
         .tracker = null,
         .background = &ctx.background,
         .session = &ctx.session,
@@ -2173,36 +2203,6 @@ fn cliAdmissionContext(
     return tool_ctx;
 }
 
-fn requestSandboxWideningForRuntime(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-    call: ToolCall,
-    review_turn: permission_auto_classifier.ReviewTurnContext,
-    permission_mode: PermissionMode,
-    local_grants: []const PermissionGrant,
-    live_authority: ?agent_runtime.LiveToolAuthority,
-    advertised_dynamic_tool_names: []const []const u8,
-    required: agent_runtime.SandboxScopeRequired,
-) !command_admission.PermissionOutcome {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, review_turn);
-    return finishCliPermissionOutcome(
-        ctx,
-        tool_ctx,
-        arena,
-        call,
-        permission_mode,
-        try tool_admission.requestSandboxWideningOutcome(
-            tool_ctx.admissionInputWithLiveAuthority(live_authority),
-            arena,
-            call,
-            permission_mode,
-            local_grants,
-            required.wideningInput(),
-        ),
-    );
-}
-
 fn requestPreparedFileMutationPermissionOutcomeForRuntime(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, review_turn);
@@ -2261,16 +2261,6 @@ fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator
                 action.authority,
                 action.human_approval,
             ),
-            .sandbox_widening => |widening| try tool_admission.revalidateLiveSandboxWideningOutcome(
-                tool_ctx.admissionInputWithLiveAuthority(live_authority),
-                arena,
-                call,
-                permission_mode,
-                local_grants,
-                widening.authority,
-                widening.required.wideningInput(),
-                widening.human_approval,
-            ),
         } else try tool_admission.requestPermissionOutcome(
             tool_ctx.admissionInputWithLiveAuthority(live_authority),
             arena,
@@ -2303,7 +2293,7 @@ fn finishCliPermissionOutcome(
             "noninteractive_permission_prompt_unavailable",
             "fx ask: rerun in the interactive shell to approve this action, or add a narrow matching permission rule before retrying\n",
         ),
-        .approval_required, .sandbox_widening => try writeBlockedActionGuidance(
+        .approval_required => try writeBlockedActionGuidance(
             ctx,
             "fx ask: permission required for tool execution in noninteractive mode",
             label,
@@ -2526,9 +2516,8 @@ fn executeToolCallAuthorized(
 fn captureToolExecutionError(
     ctx: *AskContext,
     request: agent_runtime.ToolExecutionRequest,
-    err: anyerror,
+    _: anyerror,
 ) void {
-    if (request.isSandboxWideningRetryCancellationError(err)) return;
     if (ctx.output_mode.capturesJson()) {
         appendToolCallRecordBestEffort(ctx, request.call, "error", null);
     }
@@ -2539,7 +2528,6 @@ fn captureToolExecutionResult(
     request: agent_runtime.ToolExecutionRequest,
     result: ToolExecutionResult,
 ) void {
-    if (request.resultAwaitsSandboxWidening(result)) return;
     if (ctx.output_mode.capturesJson()) {
         appendToolCallRecordBestEffort(
             ctx,
@@ -3373,7 +3361,6 @@ fn resolveAskSubagentAuthority(
                 },
             },
         },
-        ctx.sandbox_backend,
         owned_integrations,
         ctx.permission_rules,
         &.{},
@@ -3701,16 +3688,6 @@ fn takeCorePermissionRules(_: Allocator, startup: *app_lifecycle.StartupState) !
     return startup.takePermissionRules();
 }
 
-fn toCoreSandbox(kind: anytype) @import("../permissions/sandbox.zig").BackendKind {
-    return switch (kind) {
-        .macos => .macos,
-        .vercel => .vercel,
-        .just_bash => .just_bash,
-        .none => .none,
-        .auto => .auto,
-    };
-}
-
 fn loadStartupStateDefault(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -3881,16 +3858,6 @@ const AskAttentionCapture = struct {
     }
 };
 
-fn unavailableDevboxForTest(
-    _: ?*anyopaque,
-    _: Allocator,
-    _: []const u8,
-    _: []const u8,
-    _: devbox_executor.Control,
-) devbox_executor.ProviderError!devbox_executor.VercelOutcome {
-    return .unavailable;
-}
-
 const test_modes = [_]mode_registry.ModeSpec{
     .{
         .id = "inspect",
@@ -3933,7 +3900,6 @@ fn testConfig() Config {
         .max_history_turns = 2,
         .mode_registry = test_mode_registry,
         .load_mcp_runtime = testNoMcpRuntime,
-        .devbox_provider = .{ .execute_fn = unavailableDevboxForTest },
     };
 }
 
@@ -4046,7 +4012,6 @@ fn testProcessQueuedPromptChecksTimeout(deps: *const agent_runtime.AgentRuntimeD
     try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, ctx.web_search_runtime.gateway_chat_url);
     try std.testing.expect(ctx.web_search_runtime.provider.?.execute_fn == ctx.cfg.gateway_provider.web_search.execute_fn);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
-    try std.testing.expect(tool_ctx.devbox_provider.?.execute_fn == unavailableDevboxForTest);
     try testPushAssistantText(deps, "assistant text");
 }
 
@@ -5292,6 +5257,23 @@ test "stdin prompt errors keep exact structured names" {
     );
 }
 
+test "image preparation failure has stable text and JSON contracts" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqualStrings(
+        image_attachments.image_preparation_failed_notice,
+        askErrorNotice(error.ImagePreparationFailed).?,
+    );
+    try std.testing.expect(askErrorNotice(error.Cancelled) == null);
+    try std.testing.expect(askErrorNotice(error.TimedOut) == null);
+
+    const json = try renderErrorJsonResult(alloc, @errorName(error.ImagePreparationFailed));
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"ImagePreparationFailed\"}\n",
+        json,
+    );
+}
+
 test "stdin read failure has distinct text and JSON output contracts" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
@@ -6389,59 +6371,6 @@ test "fx ask prepared file mutation callback preserves terminal permission promp
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
 }
 
-test "fx ask headless sandbox widening keeps exhausted recovery model-visible" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(alloc);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(alloc);
-    var ctx = AskContext.init(
-        alloc,
-        testConfig(),
-        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
-        "/tmp/workspace",
-    );
-    defer ctx.deinit();
-    ctx.sandbox_backend = .macos;
-
-    const call: ToolCall = .{
-        .id = "sandbox-widening",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm install\"}",
-    };
-    var review_turn = TestReviewTurn.init("Install the workspace dependencies.", call);
-    const review_context = review_turn.context();
-    const tool_ctx = cliAdmissionContext(&ctx, &.{}, review_context);
-    const required: agent_runtime.SandboxScopeRequired = .{
-        .phase = .preflight,
-        .restricted_fingerprint = .init(try tool_admission.runCommandContext(
-            tool_ctx.admissionInput(),
-            arena,
-            call,
-        )),
-    };
-    const runtime_deps = agentRuntimeDeps(&ctx);
-
-    const outcome = try runtime_deps.request_sandbox_widening(
-        runtime_deps.ctx,
-        arena,
-        call,
-        review_context,
-        .auto,
-        &.{},
-        null,
-        &.{},
-        required,
-    );
-    try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
-    try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
-    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
-}
-
 test "fx ask auto mode uses automatic allow for external prepared file mutation" {
     const FakeClassifier = struct {
         calls: usize = 0,
@@ -6885,7 +6814,7 @@ test "final ask json keeps terminal tool call shape and adds command result" {
     records[0] = .{
         .name = try alloc.dupe(u8, "terminal"),
         .status = try alloc.dupe(u8, "success"),
-        .command_result_json = try alloc.dupe(u8, "{\"kind\":\"foreground\",\"command\":\"printf ok\",\"cwd\":\"/tmp\",\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"stdout_bytes\":2,\"stderr_bytes\":0,\"truncated\":false,\"sandbox_denied\":false}"),
+        .command_result_json = try alloc.dupe(u8, "{\"kind\":\"foreground\",\"command\":\"printf ok\",\"cwd\":\"/tmp\",\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"stdout_bytes\":2,\"stderr_bytes\":0,\"truncated\":false}"),
     };
     const result = PromptRunResult{
         .exit_code = 0,
@@ -8571,75 +8500,6 @@ test "fx ask JSON permission-denied capture is best effort under allocation fail
     }, "{\"error\":{\"type\":\"tool_permission_denied\"}}", null);
 
     try std.testing.expectEqual(@as(usize, 0), ctx.tool_call_records.items.len);
-}
-
-test "fx ask defers cancelled sandbox retry capture to the common projection" {
-    const alloc = std.testing.allocator;
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(alloc);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(alloc);
-    var ctx = AskContext.init(
-        alloc,
-        testConfig(),
-        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
-        "/tmp/workspace",
-    );
-    defer ctx.deinit();
-    ctx.output_mode = .json;
-    const call = ToolCall{
-        .id = "retry",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
-    };
-    const request: agent_runtime.ToolExecutionRequest = .{
-        .call_allocator = alloc,
-        .result_allocator = alloc,
-        .call = call,
-        .authority = .{ .run_command = .{ .shell_allowed = .{
-            .fingerprint = .{
-                .command = "npm test",
-                .resolved_cwd = "/tmp/workspace",
-                .background = false,
-                .resolved_backend = .none,
-                .target_os = std_builtin.os.tag,
-                .scope = .broader,
-            },
-            .source = .auto_classifier,
-        } } },
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = ctx.max_tool_result_bytes,
-    };
-
-    captureToolExecutionError(&ctx, request, error.CancelledBeforeExecution);
-    captureToolExecutionError(&ctx, request, error.Cancelled);
-    try std.testing.expectEqual(@as(usize, 0), ctx.tool_call_records.items.len);
-    captureToolExecutionResult(&ctx, request, .{
-        .status = .failure,
-        .cancelled = true,
-        .model_output = "raw retry cancellation",
-        .command_result_json = "{\"attempt\":\"broader\"}",
-    });
-    try std.testing.expectEqual(@as(usize, 0), ctx.tool_call_records.items.len);
-
-    try recordToolCallRejected(
-        @ptrCast(&ctx),
-        alloc,
-        call,
-        "combined restricted and broader evidence",
-        "{\"attempt\":\"broader\",\"retained\":true}",
-    );
-    try std.testing.expectEqual(@as(usize, 1), ctx.tool_call_records.items.len);
-    try std.testing.expectEqualStrings(
-        "{\"attempt\":\"broader\",\"retained\":true}",
-        ctx.tool_call_records.items[0].command_result_json.?,
-    );
-
-    var ordinary_request = request;
-    ordinary_request.authority = .ordinary;
-    captureToolExecutionError(&ctx, ordinary_request, error.Cancelled);
-    try std.testing.expectEqual(@as(usize, 2), ctx.tool_call_records.items.len);
 }
 
 test "fx ask JSON captures parallel tool results without corrupting records" {

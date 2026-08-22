@@ -66,7 +66,7 @@ async function disablePromptHistory(
 ): Promise<void> {
   await session.sendText("/settings");
   await session.waitForText("←→ Change", TIMEOUT);
-  for (let index = 0; index < 14; index += 1) {
+  for (let index = 0; index < 12; index += 1) {
     await session.sendKeys("Down");
   }
   await session.sendKeys("Left");
@@ -288,10 +288,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("● Switched to anthropic/claude-opus-4.7", TIMEOUT);
         await session.sendText("/fast");
         await session.waitForText("● Fast: on", TIMEOUT);
-        await session.sendText("/sandbox none");
-        await session.waitForText("● Sandbox: switched to none", TIMEOUT);
-        await session.sendText("/statusline sandbox");
-        await session.waitForText("● Statusline: sandbox:", TIMEOUT);
         await session.sendText("/statusline context");
         await session.waitForText("● Statusline: context:", TIMEOUT);
         await session.sendText("/statusline session");
@@ -313,7 +309,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(stored.startup_scrollback).toBe(false);
         expect(stored.prompt_history).toMatchObject({ enabled: false });
         expect(stored.statusLine).toMatchObject({
-          sandbox: true,
           context: true,
           session: true,
           workspace: true,
@@ -330,7 +325,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           expect(override).not.toHaveProperty("fast_mode");
           expect(override).not.toHaveProperty("startup_scrollback");
           expect(override.prompt_history).toEqual({ future: historyFuture });
-          expect(override.statusLine).toEqual({ workspace: false, future: statusFuture });
+          expect(override.statusLine).toEqual({ sandbox: false, workspace: false, future: statusFuture });
           expect(override.future_workspace).toEqual({ nested: futureWorkspace });
         }
         expect(readFileSync(join(workspaceA, ".fx.json"), "utf8")).toBe(projectABytes);
@@ -343,7 +338,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           "fast_mode",
           "startup_scrollback",
           "prompt_history_enabled",
-          "statusline_sandbox",
           "statusline_context",
           "statusline_session",
         ].map((field) => migrationSnapshotPath(home, field));
@@ -375,9 +369,9 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           TIMEOUT,
         );
         await session.sendText("/statusline");
-        const statusline = await session.waitForText("Sandbox  ", TIMEOUT);
+        const statusline = await session.waitForText("Context  ", TIMEOUT);
         expect(statusline).toContain("Status line");
-        expect(statusline).toContain("Sandbox");
+        expect(statusline).not.toContain("Sandbox");
         expect(statusline).toContain("Context");
         expect(statusline).toContain("Session");
         expect(statusline).toContain("off  on");
@@ -415,7 +409,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
   );
 
   serialTest(
-    "sandbox and unscoped allowlist stay local while explicit user rules cross projects",
+    "unscoped allowlist stays local while explicit user rules cross projects",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-config-permission-scopes-"));
       try {
@@ -447,8 +441,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           stderrPath: stderrAPath,
         });
         await session.waitForText("Run /help", TIMEOUT);
-        await session.sendText("/sandbox none");
-        await session.waitForText("● Sandbox: switched to none", TIMEOUT);
         await session.sendText('/allowlist add command "local-a *"');
         await session.waitForText("(scope=local)", TIMEOUT);
         await session.sendText('/allowlist user add command "user *"');
@@ -461,7 +453,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           readFileSync(join(home, ".fx", "settings.json"), "utf8"),
         );
         expect(afterA.permission.bash["user *"]).toBe("allow");
-        expect(afterA.workspaces[workspaceARoot].sandbox).toBe("none");
         expect(afterA.workspaces[workspaceARoot].permission.bash["local-a *"]).toBe(
           "allow",
         );
@@ -473,14 +464,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           stderrPath: stderrBPath,
         });
         await session.waitForText("Run /help", TIMEOUT);
-        await session.sendText("/sandbox");
-        const sandbox = await session.waitForText("←→ Change", TIMEOUT);
-        expect(sandbox).toContain("Sandbox");
-        expect(sandbox).toContain("Command sandbox");
-        expect(sandbox).toContain("os  none");
-        expect(sandbox).not.toContain("✓");
-        await session.sendKeys("Escape");
-        await session.waitForComposer(TIMEOUT);
         await session.sendText("/allowlist view local");
         await session.waitForText(
           "● Allowlist: local persistent allow rules: (none)",
@@ -1669,11 +1652,11 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         ]);
         await Promise.all([
           session.sendText("/settings startup-scrollback off"),
-          secondSession.sendText("/statusline sandbox"),
+          secondSession.sendText("/statusline context"),
         ]);
         await Promise.all([
           session.waitForText("startup_scrollback: off", TIMEOUT),
-          secondSession.waitForText("● Statusline: sandbox:", TIMEOUT),
+          secondSession.waitForText("● Statusline: context:", TIMEOUT),
         ]);
         await Promise.all([
           session.sendText("/quit"),
@@ -1691,7 +1674,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         );
         expect(stored.future_global).toEqual({ nested: "keep-global" });
         expect(stored.startup_scrollback).toBe(false);
-        expect(stored.statusLine).toMatchObject({ sandbox: true });
+        expect(stored.statusLine).toMatchObject({ context: true });
         expect(stored.workspaces[workspaceRoot]).toMatchObject({
           future_workspace: {
             nested: { keep: true },

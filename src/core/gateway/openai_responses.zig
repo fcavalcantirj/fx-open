@@ -6,8 +6,40 @@ const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const max_sse_line_bytes: usize = 32 * 1024 * 1024;
+pub const max_sse_aggregate_bytes: usize = 64 * 1024 * 1024;
+pub const max_sse_events: usize = 100_000;
+pub const max_tool_calls: usize = 128;
+pub const max_tool_identity_bytes: usize = 1024;
+pub const max_tool_arguments_bytes: usize = 4 * 1024 * 1024;
+pub const max_provider_state_bytes: usize = 4 * 1024 * 1024;
+
+pub const Limits = struct {
+    aggregate_bytes: usize = max_sse_aggregate_bytes,
+    events: usize = max_sse_events,
+    tool_calls: usize = max_tool_calls,
+    tool_identity_bytes: usize = max_tool_identity_bytes,
+    tool_arguments_bytes: usize = max_tool_arguments_bytes,
+    provider_state_bytes: usize = max_provider_state_bytes,
+};
 
 pub const WriteInputImageFn = *const fn (*std.Io.Writer, Allocator, image_attachments.VerifiedSnapshot) anyerror!void;
+
+pub fn validateReplayMessage(message: types.ChatMessage, limits: Limits) !void {
+    if (message.provider_state_json) |state_json| {
+        if (state_json.len > limits.provider_state_bytes) return error.OpenAICodexProviderStateTooLarge;
+    }
+    if (message.tool_calls.len > limits.tool_calls) return error.OpenAICodexToolCallLimitExceeded;
+    for (message.tool_calls) |call| {
+        if (call.id.len == 0 or call.id.len > limits.tool_identity_bytes or
+            call.name.len == 0 or call.name.len > limits.tool_identity_bytes)
+        {
+            return error.OpenAICodexToolCallLimitExceeded;
+        }
+        if (call.arguments_json.len > limits.tool_arguments_bytes) {
+            return error.OpenAICodexToolArgumentsTooLarge;
+        }
+    }
+}
 
 pub fn writeInput(
     writer: *std.Io.Writer,
@@ -42,6 +74,7 @@ pub fn writeInput(
                 try writer.writeAll("]}");
             },
             .assistant => {
+                try validateReplayMessage(message, .{});
                 if (message.provider_state_json) |state_json| {
                     var state = std.json.parseFromSlice(std.json.Value, alloc, state_json, .{}) catch
                         return error.InvalidOpenAICodexProviderState;
@@ -222,6 +255,7 @@ pub fn consumeSse(
     on_tool_input_chunk: ?stream_provider.StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
+    limits: Limits,
 ) !types.GatewayCompletion {
     var content: std.ArrayList(u8) = .empty;
     errdefer content.deinit(alloc);
@@ -241,10 +275,14 @@ pub fn consumeSse(
     errdefer if (generation_id) |id| alloc.free(id);
     var terminal_seen = false;
     var saw_content_delta = false;
+    var event_count: usize = 0;
+    var aggregate_bytes: usize = 0;
 
     while (try sse.next(alloc, reader)) |json_text| {
         defer sse.release();
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        event_count = try checkedAccumulatedSize(event_count, 1, limits.events);
+        aggregate_bytes = try checkedAccumulatedSize(aggregate_bytes, json_text.len, limits.aggregate_bytes);
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch
             return error.InvalidOpenAICodexSseEvent;
         defer parsed.deinit();
@@ -260,7 +298,7 @@ pub fn consumeSse(
                 const call_id = stringField(item.object, "call_id") orelse continue;
                 const name = stringField(item.object, "name") orelse continue;
                 if (findTool(tools.items, output_index) == null) {
-                    try appendTool(alloc, &tools, output_index, call_id, name);
+                    try appendTool(alloc, &tools, output_index, call_id, name, limits);
                     if (on_tool_start) |callback| callback(callback_ctx, call_id, name, null);
                 }
             }
@@ -282,7 +320,7 @@ pub fn consumeSse(
             const output_index = integerField(parsed.value.object, "output_index") orelse continue;
             const delta = stringField(parsed.value.object, "delta") orelse continue;
             const index = findTool(tools.items, output_index) orelse continue;
-            try tools.items[index].arguments.appendSlice(alloc, delta);
+            try appendToolArguments(alloc, &tools.items[index].arguments, delta, limits.tool_arguments_bytes);
             if (on_tool_input_chunk) |callback| callback(callback_ctx, delta);
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
             const output_index = integerField(parsed.value.object, "output_index") orelse continue;
@@ -291,11 +329,11 @@ pub fn consumeSse(
             const previous_len = tools.items[index].arguments.items.len;
             if (std.mem.startsWith(u8, arguments, tools.items[index].arguments.items)) {
                 const suffix = arguments[previous_len..];
-                try tools.items[index].arguments.appendSlice(alloc, suffix);
+                try appendToolArguments(alloc, &tools.items[index].arguments, suffix, limits.tool_arguments_bytes);
                 if (suffix.len > 0) if (on_tool_input_chunk) |callback| callback(callback_ctx, suffix);
             } else {
                 tools.items[index].arguments.clearRetainingCapacity();
-                try tools.items[index].arguments.appendSlice(alloc, arguments);
+                try appendToolArguments(alloc, &tools.items[index].arguments, arguments, limits.tool_arguments_bytes);
             }
         } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
             const output_index = integerField(parsed.value.object, "output_index") orelse continue;
@@ -306,19 +344,24 @@ pub fn consumeSse(
                 if (findTool(tools.items, output_index)) |index| {
                     if (stringField(item.object, "arguments")) |arguments| {
                         if (tools.items[index].arguments.items.len == 0) {
-                            try tools.items[index].arguments.appendSlice(alloc, arguments);
+                            try appendToolArguments(alloc, &tools.items[index].arguments, arguments, limits.tool_arguments_bytes);
                         }
                     }
                 }
             } else if (std.mem.eql(u8, item_type, "reasoning") and
                 stringField(item.object, "encrypted_content") != null)
             {
+                var encoded: std.Io.Writer.Allocating = .init(alloc);
+                defer encoded.deinit();
+                try std.json.Stringify.value(item, .{}, &encoded.writer);
+                const framed_size = try checkedAccumulatedSize(encoded.written().len, 2, limits.provider_state_bytes);
+                _ = try checkedAccumulatedSize(provider_state.written().len, framed_size, limits.provider_state_bytes);
                 if (provider_state_count == 0) {
                     try provider_state.writer.writeByte('[');
                 } else {
                     try provider_state.writer.writeByte(',');
                 }
-                try std.json.Stringify.value(item, .{}, &provider_state.writer);
+                try provider_state.writer.writeAll(encoded.written());
                 provider_state_count += 1;
             } else if (std.mem.eql(u8, item_type, "message") and !saw_content_delta) {
                 if (item.object.get("content")) |parts| if (parts == .array) {
@@ -403,7 +446,13 @@ pub fn appendTool(
     output_index: i64,
     call_id: []const u8,
     name: []const u8,
+    limits: Limits,
 ) !void {
+    if (tools.items.len >= limits.tool_calls or call_id.len == 0 or call_id.len > limits.tool_identity_bytes or
+        name.len == 0 or name.len > limits.tool_identity_bytes)
+    {
+        return error.OpenAICodexToolCallLimitExceeded;
+    }
     const id = try alloc.dupe(u8, call_id);
     errdefer alloc.free(id);
     const owned_name = try alloc.dupe(u8, name);
@@ -413,6 +462,24 @@ pub fn appendTool(
         .id = id,
         .name = owned_name,
     });
+}
+
+pub fn appendToolArguments(
+    alloc: Allocator,
+    arguments: *std.ArrayList(u8),
+    delta: []const u8,
+    maximum: usize,
+) !void {
+    _ = checkedAccumulatedSize(arguments.items.len, delta.len, maximum) catch
+        return error.OpenAICodexToolArgumentsTooLarge;
+    try arguments.appendSlice(alloc, delta);
+}
+
+pub fn checkedAccumulatedSize(current: usize, additional: usize, maximum: usize) !usize {
+    const next = std.math.add(usize, current, additional) catch
+        return error.OpenAICodexResourceLimitExceeded;
+    if (next > maximum) return error.OpenAICodexResourceLimitExceeded;
+    return next;
 }
 
 pub fn appendCaptured(
@@ -520,6 +587,7 @@ test "OpenAI Responses SSE maps text reasoning tools and usage" {
         null,
         &cancelled,
         null,
+        .{},
     );
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));

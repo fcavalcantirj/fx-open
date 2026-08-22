@@ -261,6 +261,7 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
         request.on_tool_input_chunk,
         request.cancel_flag,
         request.content_capture_limit,
+        .{},
     );
     return .{
         .status = .ok,
@@ -365,4 +366,271 @@ test "OpenAI Codex rejects a wrong-origin credential before network I/O" {
         }),
     );
     try std.testing.expectEqual(stream_provider.DeliveryCertainty.State.definitely_unsent, delivery.load());
+}
+
+const max_provider_state_bytes = openai_responses.max_provider_state_bytes;
+const max_tool_calls = openai_responses.max_tool_calls;
+const max_tool_identity_bytes = openai_responses.max_tool_identity_bytes;
+const max_tool_arguments_bytes = openai_responses.max_tool_arguments_bytes;
+const CodexLimits = openai_responses.Limits;
+
+fn makeSizedProviderState(alloc: Allocator, size: usize) ![]u8 {
+    const prefix = "[{\"type\":\"reasoning\",\"encrypted_content\":\"";
+    const suffix = "\"}]";
+    if (size < prefix.len + suffix.len) return error.TestProviderStateSizeTooSmall;
+    const state = try alloc.alloc(u8, size);
+    @memcpy(state[0..prefix.len], prefix);
+    @memset(state[prefix.len .. size - suffix.len], 'x');
+    @memcpy(state[size - suffix.len ..], suffix);
+    return state;
+}
+
+fn makeSizedToolArguments(alloc: Allocator, size: usize) ![]u8 {
+    const prefix = "{\"value\":\"";
+    const suffix = "\"}";
+    if (size < prefix.len + suffix.len) return error.TestToolArgumentsSizeTooSmall;
+    const arguments = try alloc.alloc(u8, size);
+    @memcpy(arguments[0..prefix.len], prefix);
+    @memset(arguments[prefix.len .. size - suffix.len], 'x');
+    @memcpy(arguments[size - suffix.len ..], suffix);
+    return arguments;
+}
+
+fn buildOpenAICodexReplay(messages: []const types.ChatMessage) ![]u8 {
+    return agent_stream_provider.build(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .serialized_tools = "[]",
+        .messages = messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+}
+
+fn expectOpenAICodexReplaySuccess(messages: []const types.ChatMessage) !void {
+    const body = try buildOpenAICodexReplay(messages);
+    std.testing.allocator.free(body);
+}
+
+fn expectOpenAICodexReplayError(expected: anyerror, messages: []const types.ChatMessage) !void {
+    const result = buildOpenAICodexReplay(messages);
+    if (result) |body| {
+        std.testing.allocator.free(body);
+        return error.TestExpectedOpenAICodexReplayError;
+    } else |err| {
+        try std.testing.expectEqual(expected, err);
+    }
+}
+
+test "OpenAI Codex replay provider state accepts the limit and rejects one byte beyond" {
+    {
+        const provider_state = try makeSizedProviderState(std.testing.allocator, max_provider_state_bytes);
+        defer std.testing.allocator.free(provider_state);
+        const messages = [_]types.ChatMessage{.{
+            .role = .assistant,
+            .provider_state_json = provider_state,
+        }};
+        try expectOpenAICodexReplaySuccess(&messages);
+    }
+    {
+        const provider_state = try makeSizedProviderState(std.testing.allocator, max_provider_state_bytes + 1);
+        defer std.testing.allocator.free(provider_state);
+        const messages = [_]types.ChatMessage{.{
+            .role = .assistant,
+            .provider_state_json = provider_state,
+        }};
+        try expectOpenAICodexReplayError(error.OpenAICodexProviderStateTooLarge, &messages);
+    }
+}
+
+test "OpenAI Codex replay tool count accepts the limit and rejects one call beyond" {
+    var calls: [max_tool_calls + 1]types.ToolCall = undefined;
+    for (0..max_tool_calls) |index| {
+        calls[index] = .{
+            .id = "call_ok",
+            .name = "read_file",
+            .arguments_json = "{}",
+        };
+    }
+    calls[max_tool_calls] = .{
+        .id = "call_overflow",
+        .name = "read_file",
+        .arguments_json = "{}",
+    };
+    const messages = [_]types.ChatMessage{.{ .role = .assistant, .tool_calls = calls[0..] }};
+    try expectOpenAICodexReplayError(error.OpenAICodexToolCallLimitExceeded, &messages);
+    try expectOpenAICodexReplaySuccess(&[_]types.ChatMessage{.{ .role = .assistant, .tool_calls = calls[0..max_tool_calls] }});
+}
+
+test "OpenAI Codex replay tool identity accepts the limit and rejects one byte beyond" {
+    const oversized_id = try std.testing.allocator.alloc(u8, max_tool_identity_bytes + 1);
+    defer std.testing.allocator.free(oversized_id);
+    @memset(oversized_id, 'x');
+    const messages = [_]types.ChatMessage{.{
+        .role = .assistant,
+        .tool_calls = &.{.{ .id = oversized_id, .name = "read_file", .arguments_json = "{}" }},
+    }};
+    try expectOpenAICodexReplayError(error.OpenAICodexToolCallLimitExceeded, &messages);
+}
+
+test "OpenAI Codex replay tool arguments accept the limit and reject one byte beyond" {
+    const arguments = try makeSizedToolArguments(std.testing.allocator, max_tool_arguments_bytes);
+    defer std.testing.allocator.free(arguments);
+    const messages = [_]types.ChatMessage{.{
+        .role = .assistant,
+        .tool_calls = &.{.{ .id = "call_1", .name = "read_file", .arguments_json = arguments }},
+    }};
+    try expectOpenAICodexReplaySuccess(&messages);
+
+    const oversized = try makeSizedToolArguments(std.testing.allocator, max_tool_arguments_bytes + 1);
+    defer std.testing.allocator.free(oversized);
+    const overflow_messages = [_]types.ChatMessage{.{
+        .role = .assistant,
+        .tool_calls = &.{.{ .id = "call_1", .name = "read_file", .arguments_json = oversized }},
+    }};
+    try expectOpenAICodexReplayError(error.OpenAICodexToolArgumentsTooLarge, &overflow_messages);
+}
+
+fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.GatewayCompletion {
+    var reader: std.Io.Reader = .fixed(sse_text);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var callback_context: u8 = 0;
+    return openai_responses.consumeSse(
+        std.testing.allocator,
+        &reader,
+        &callback_context,
+        struct {
+            fn ignore(_: *anyopaque, _: []const u8) void {}
+        }.ignore,
+        null,
+        null,
+        null,
+        &cancelled,
+        null,
+        limits,
+    );
+}
+
+fn freeOpenAICodexTestCompletion(completion: types.GatewayCompletion) void {
+    if (completion.content) |value| std.testing.allocator.free(@constCast(value));
+    types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
+    if (completion.generation_id) |value| std.testing.allocator.free(@constCast(value));
+    if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
+}
+
+fn expectOpenAICodexSseError(expected: anyerror, sse_text: []const u8, limits: CodexLimits) !void {
+    const result = consumeOpenAICodexTestSse(sse_text, limits);
+    if (result) |completion| {
+        freeOpenAICodexTestCompletion(completion);
+        return error.TestExpectedOpenAICodexSseError;
+    } else |err| {
+        try std.testing.expectEqual(expected, err);
+    }
+}
+
+test "OpenAI Codex checked stream sizes accept the bound and reject overflow" {
+    try std.testing.expectEqual(@as(usize, 7), try openai_responses.checkedAccumulatedSize(6, 1, 7));
+    try std.testing.expectError(
+        error.OpenAICodexResourceLimitExceeded,
+        openai_responses.checkedAccumulatedSize(std.math.maxInt(usize), 1, std.math.maxInt(usize)),
+    );
+}
+
+test "OpenAI Codex rejects cumulative event and byte limits" {
+    const terminal_json = "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}";
+    const terminal_event = "data: " ++ terminal_json ++ "\n\n";
+    const completion = try consumeOpenAICodexTestSse(
+        terminal_event,
+        .{ .events = 1, .aggregate_bytes = terminal_json.len },
+    );
+    defer freeOpenAICodexTestCompletion(completion);
+
+    const event = "data: {\"type\":\"response.reasoning_summary_part.done\"}\n\n";
+    try expectOpenAICodexSseError(
+        error.OpenAICodexResourceLimitExceeded,
+        event ++ event,
+        .{ .events = 1 },
+    );
+    try expectOpenAICodexSseError(
+        error.OpenAICodexResourceLimitExceeded,
+        terminal_event,
+        .{ .aggregate_bytes = terminal_json.len - 1 },
+    );
+}
+
+test "OpenAI Codex rejects oversized streamed tool identities" {
+    try expectOpenAICodexSseError(
+        error.OpenAICodexToolCallLimitExceeded,
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"ok\"}}\n\n",
+        .{ .tool_identity_bytes = 3 },
+    );
+    try expectOpenAICodexSseError(
+        error.OpenAICodexToolCallLimitExceeded,
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"ok\",\"name\":\"read\"}}\n\n",
+        .{ .tool_identity_bytes = 3 },
+    );
+}
+
+test "OpenAI Codex bounds every streamed argument representation and cleans staged state" {
+    const prefix =
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\"}}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}}\n\n";
+    const cases = [_][]const u8{
+        prefix ++ "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"four\"}\n\n",
+        prefix ++ "data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"four\"}\n\n",
+        prefix ++ "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"arguments\":\"four\"}}\n\n",
+    };
+    for (cases) |sse_text| {
+        try expectOpenAICodexSseError(
+            error.OpenAICodexToolArgumentsTooLarge,
+            sse_text,
+            .{ .tool_arguments_bytes = 3 },
+        );
+    }
+}
+
+test "OpenAI Codex rejects oversized encrypted provider state" {
+    try expectOpenAICodexSseError(
+        error.OpenAICodexResourceLimitExceeded,
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}}\n\n",
+        .{ .provider_state_bytes = 16 },
+    );
+}
+
+test "OpenAI Codex provider state accepts the exact framed limit" {
+    const expected_state = "[{\"type\":\"reasoning\",\"encrypted_content\":\"a\"},{\"type\":\"reasoning\",\"encrypted_content\":\"b\"}]";
+    const sse_text =
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"a\"}}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"b\"}}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+    const completion = try consumeOpenAICodexTestSse(
+        sse_text,
+        .{ .provider_state_bytes = expected_state.len },
+    );
+    defer freeOpenAICodexTestCompletion(completion);
+    try std.testing.expectEqualStrings(expected_state, completion.provider_state_json.?);
+    try expectOpenAICodexSseError(
+        error.OpenAICodexResourceLimitExceeded,
+        sse_text,
+        .{ .provider_state_bytes = expected_state.len - 1 },
+    );
+}
+
+test "OpenAI Codex rejects a 129th streamed tool call" {
+    var stream: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stream.deinit();
+    for (0..129) |index| {
+        try stream.writer.print(
+            "data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_{d}\",\"name\":\"read_file\"}}}}\n\n",
+            .{ index, index },
+        );
+    }
+    try stream.writer.writeAll("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n");
+
+    const result = consumeOpenAICodexTestSse(stream.written(), .{});
+    if (result) |completion| {
+        freeOpenAICodexTestCompletion(completion);
+        return error.TestExpectedToolCallLimit;
+    } else |err| {
+        try std.testing.expectEqual(error.OpenAICodexToolCallLimitExceeded, err);
+    }
 }
