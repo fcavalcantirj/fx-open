@@ -54,12 +54,25 @@ fi
 [ "$APPLY" = 1 ] || { echo; echo "dry run. Re-run with --apply to rebase main onto $latest and push."; exit 0; }
 [ "$fork_base" != "$tag_sha" ] || exit 0
 
-[ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "working tree has tracked changes; commit or stash first" >&2; exit 1; }
-current="$(git branch --show-current)"
-echo; echo "rebasing $fork_only fork commit(s) of main onto $latest ..."
-git switch -q main
-git rebase --onto "$tag_sha" "$fork_base" main
-git push --force-with-lease origin main
-git push -q origin "refs/tags/$latest"
-git switch -q "$current"
-echo "done: main = $latest + $fork_only fork commit(s) -> $(git rev-parse --short main); tag $latest pushed to origin"
+# Re-create main as: release tag + ONE commit carrying every path this fork changed (README, openai-compat/, the
+# skill). No rebase, so upstream README edits can never conflict. Done in a throwaway worktree; the current checkout
+# and any uncommitted work in it are never touched.
+old_main="$(git rev-parse main)"
+paths="$(git diff --name-only "$fork_base" main)"
+[ -n "$paths" ] || { echo "nothing fork-specific on main to carry over" >&2; exit 1; }
+wt="$(mktemp -d)/main"
+echo; echo "re-creating main = $latest + fork files ($(printf '%s\n' "$paths" | wc -l | tr -d ' ') paths) in a temporary worktree ..."
+git worktree add -q --detach "$wt" "$tag_sha"
+git -C "$wt" checkout -q -B main "$tag_sha"
+printf '%s\n' "$paths" | while IFS= read -r f; do
+  if git cat-file -e "$old_main:$f" 2>/dev/null; then git -C "$wt" checkout -q "$old_main" -- "$f"; git -C "$wt" add -f -- "$f"; else git -C "$wt" rm -q --ignore-unmatch -- "$f"; fi
+done
+git -C "$wt" commit -q -m "fx-open: docs and tooling on $latest
+
+Carried over from $(git rev-parse --short "$old_main") (fork commits squashed onto the upstream release tag)." \
+  || { git worktree remove --force "$wt"; git worktree prune; echo "nothing to commit" >&2; exit 1; }
+git -C "$wt" push --force-with-lease=main:"$old_main" origin main
+git -C "$wt" push -q origin "refs/tags/$latest"
+git worktree remove --force "$wt"; git worktree prune
+git fetch -q origin && git branch -f main origin/main
+echo "done: main = $latest + 1 fork commit -> $(git rev-parse --short main); tag $latest pushed to origin"

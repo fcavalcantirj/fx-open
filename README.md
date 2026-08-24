@@ -134,7 +134,7 @@ The fix belongs on PR #168 (`boozedog/fx:feature/openai-compatible-transport`). 
 <details>
 <summary><b>Staying current with upstream</b></summary>
 
-This fork runs no CI of its own (Actions are disabled — upstream's CI is trusted). `main` tracks upstream **releases**, not dev: `./openai-compat/sync-upstream.sh` reports the latest upstream release, where `main` stands, and whether PR #168 moved or merged; `--apply` rebases the fork's commits onto that release tag and pushes. `openai-compat` stays on PR #168 `f0c131c4` + the fix until PR #168 lands upstream.
+Upstream's `CI` and `Full CI` run on this fork (public repo, free runners); the release/publish workflows are disabled — they need upstream's secrets. `main` tracks upstream **releases**, not dev: `./openai-compat/sync-upstream.sh` reports the latest upstream release, where `main` stands, and whether PR #168 moved or merged; `--apply` re-creates `main` as that release tag plus one commit with the fork's files, and pushes. `openai-compat` stays on PR #168 `f0c131c4` + the fix until PR #168 lands upstream.
 </details>
 
 Upstream project: [vercel-labs/fx](https://github.com/vercel-labs/fx) — tiny, open, embeddable, native coding agent (Apache-2.0).
