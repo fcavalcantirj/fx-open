@@ -62,7 +62,7 @@ Upstream `fx` speaks only Vercel AI Gateway's wire (plus ChatGPT/Grok subscripti
 
 | Path | Purpose |
 |---|---|
-| `install.sh` / `test.sh` | Installer (Zig 0.16.0, build, launchers, profiles, keys) and the 30-second proof |
+| `install.sh` / `test.sh` / `sync-upstream.sh` | Installer, the 30-second proof, and the upstream-release sync routine |
 | `launchers/fx-groq`, `launchers/fx-openrouter` | Unset gateway vars, source `.env` + profile, exec the custom binary |
 | `profiles/*.env` | Per-provider settings (base URL, `chat` style, model). No secrets |
 | `patches/0001-openai-compat-tui-catalog-context.patch` | The TUI fix (also a commit on `openai-compat`) |
@@ -129,6 +129,12 @@ The profiles map `OPENAI_API_KEY` from `.env` at runtime and set `FX_OPENAI_BASE
 <summary><b>Contributing upstream</b></summary>
 
 The fix belongs on PR #168 (`boozedog/fx:feature/openai-compatible-transport`). A PR from `openai-compat` against `vercel-labs/fx` `main` would conflict: `main` is 100+ commits ahead and renamed the gateway modules PR #168 still imports.
+</details>
+
+<details>
+<summary><b>Staying current with upstream</b></summary>
+
+This fork runs no CI of its own (Actions are disabled — upstream's CI is trusted). `main` tracks upstream **releases**, not dev: `./openai-compat/sync-upstream.sh` reports the latest upstream release, where `main` stands, and whether PR #168 moved or merged; `--apply` rebases the fork's commits onto that release tag and pushes. `openai-compat` stays on PR #168 `f0c131c4` + the fix until PR #168 lands upstream.
 </details>
 
 Upstream project: [vercel-labs/fx](https://github.com/vercel-labs/fx) — tiny, open, embeddable, native coding agent (Apache-2.0).
