@@ -1,0 +1,6 @@
+# fx-open agent progress log
+# One entry per session, appended at the end of the session:
+#   <date>  session <n>  <what was done> | verified: <how, as a user would> | left: <anything broken or pending>
+# Never rewrite earlier entries.
+
+2026-08-24  session 0  harness created from the verified ledger: openai-compat/harness/feature_list.json = the 49 tasks of openai-compat/fx-openai-compat-spec.json with every "passes" reset to false for a fresh machine | verified: the original run (all 49 true) is kept unchanged at openai-compat/fx-openai-compat-spec.json | left: nothing

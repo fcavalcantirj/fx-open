@@ -1,0 +1,563 @@
+[
+  {
+    "category": "recon",
+    "description": "Load the spike state this ledger was built from (read before any other task)",
+    "steps": [
+      "Everything below was VERIFIED on this machine on 2026-08-24 by a spike session; do not re-derive it, just confirm the artifacts still exist",
+      "Goal: a locally built vercel-labs/fx (PR #168) that talks to Groq AND OpenRouter over OpenAI Chat Completions, with two launchers fx-groq and fx-openrouter, a verified tool round-trip on each, the stock fx untouched",
+      "Spike checkout: ~/src/fx-openai-compat = clone of https://github.com/vercel-labs/fx.git, branch pr-168-openai-compatible at f0c131c40a2516d024ab96776bc6211598743e16 (PR #168 head, author boozedog), merge-base df7e6245e1992758d4060c97477ceafa27770551 (= v0.0.5), 15 ahead / 103 behind origin/main (origin/main at clone = 3e96d2c51ce75e6bf2d62d98cd5b4b6132ccdac9)",
+      "Already built there: zig-out/bin/fx (ReleaseSafe, 10473808 bytes, sha256 ffdbf483f2d5540d67a90aca8eecc7aba09a060b85c1bcd1021de34bdd86cf40, build took 2m34s). Logs (untracked): build.log, test.log, e2e-openai.log",
+      "Baseline worktree: ~/src/fx-main-baseline = origin/main 3e96d2c, built, test.log holds the unit-test baseline (8483 pass / 4 skip / 6 fail)",
+      "Zig 0.16.0 installed at ~/.local/lib/zig-0.16.0/zig (ziglang.org tarball, sha256 verified). Not on PATH; call it by full path",
+      "Secrets: ~/dev/fx-open/.env (mode 600) holds GROQ_API_KEY and OPENROUTER_API_KEY. Never print them, never copy them into any other file, never commit",
+      "Stock fx to protect: ~/.local/bin/fx v0.0.5, 6431792 bytes, sha256 caad628680cd2af24d79063f109965b71c24f69c7b06318b50178c76cc40d0c9, build_revision df7e6245e199",
+      "Verified working models: Groq openai/gpt-oss-120b, OpenRouter z-ai/glm-5.3 (and openai/gpt-oss-120b on OpenRouter as a cross-provider control)",
+      "Known PR #168 bug that BLOCKS the interactive launcher: the TUI panics when the OpenAI-compatible provider is active (fx ask works). Details and fix pointer are in the task 'Fix the TUI catalog-preload null-context panic'"
+    ],
+    "passes": false
+  },
+  {
+    "category": "recon",
+    "description": "Verify the secret store .env, its mode, and that it can never be committed",
+    "steps": [
+      "Run: ls -la ~/dev/fx-open/.env and verify mode -rw------- (600); chmod 600 if wider",
+      "Run: cut -d= -f1 ~/dev/fx-open/.env | sort and verify exactly GROQ_API_KEY and OPENROUTER_API_KEY (names only; never cat the file)",
+      "Run: git -C ~/dev/fx-open rev-parse --is-inside-work-tree 2>/dev/null || echo not-a-repo (it was not a repo on 2026-08-24); if it IS a repo, ensure .env is in .gitignore and git check-ignore .env succeeds",
+      "Run: env | grep -cE '^(OPENAI_API_KEY|AI_GATEWAY_API_KEY|VERCEL_OIDC_TOKEN|FX_PROVIDER)=' and list only NAMES that are set; every fx invocation in this ledger unsets AI_GATEWAY_API_KEY, VERCEL_OIDC_TOKEN and FX_PROVIDER and sets OPENAI_API_KEY from the provider profile"
+    ],
+    "passes": false
+  },
+  {
+    "category": "recon",
+    "description": "Verify Zig 0.16.0 is present (install only if missing)",
+    "steps": [
+      "Run: ~/.local/lib/zig-0.16.0/zig version and verify exactly 0.16.0",
+      "Only if missing: cd ~/.local/lib && curl -fsSLO https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz && shasum -a 256 zig-aarch64-macos-0.16.0.tar.xz (must be b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489, 52238004 bytes) && tar -xJf zig-aarch64-macos-0.16.0.tar.xz && mv zig-aarch64-macos-0.16.0 zig-0.16.0 && rm zig-aarch64-macos-0.16.0.tar.xz",
+      "Do not brew install zig (pulls llvm@21 + lld@21); do not put a bare 'zig' on PATH; do not edit shell rc files",
+      "Record ZIG=~/.local/lib/zig-0.16.0/zig"
+    ],
+    "passes": false
+  },
+  {
+    "category": "recon",
+    "description": "Verify the spike checkout and its built binary; rebuild only if missing or dirty",
+    "steps": [
+      "Run: cd ~/src/fx-openai-compat && git remote -v && git branch --show-current && git rev-parse HEAD && git status --short",
+      "Verify remote https://github.com/vercel-labs/fx.git, branch pr-168-openai-compatible, HEAD f0c131c40a2516d024ab96776bc6211598743e16, and git status shows only untracked *.log files (no tracked changes)",
+      "Run: shasum -a 256 zig-out/bin/fx and verify ffdbf483f2d5540d67a90aca8eecc7aba09a060b85c1bcd1021de34bdd86cf40; if the binary is missing or the sha differs, run the build task",
+      "If the checkout is missing entirely: git clone https://github.com/vercel-labs/fx.git ~/src/fx-openai-compat && cd ~/src/fx-openai-compat && git fetch origin pull/168/head:pr-168-openai-compatible && git switch pr-168-openai-compatible && test \"$(git rev-parse HEAD)\" = f0c131c40a2516d024ab96776bc6211598743e16",
+      "Never merge or rebase this branch onto main: GitHub reports mergeable=CONFLICTING and main renamed src/core/gateway/gateway_json.zig to src/gateway/vercel_protocol.zig, which the PR's new files still import. The PR head tree is self-consistent and is what gets built"
+    ],
+    "passes": false
+  },
+  {
+    "category": "recon",
+    "description": "Fingerprint the stock fx and the shared ~/.fx profile before touching anything",
+    "steps": [
+      "Run: shasum -a 256 ~/.local/bin/fx and verify caad628680cd2af24d79063f109965b71c24f69c7b06318b50178c76cc40d0c9; ls -la ~/.local/bin/fx shows 6431792 bytes dated Aug 21 18:49; ~/.local/bin/fx --version prints 0.0.5",
+      "Run: ls -la ~/.fx; cat ~/.fx/settings.json 2>/dev/null. Expected state after the spike: auth.lock, sessions/, settings.lock, and settings.json containing exactly {\"yolo_acknowledged\":true} (written by --yolo runs; stock fx understands that key). Save a copy as settings.json.pre in your notes dir",
+      "Rules for every later task: never run fx upgrade; never copy anything into ~/.fx/bin; never overwrite ~/.local/bin/fx; never run 'fx provider openai' or pick a provider in /setup against the real HOME (it writes \"provider\":\"openai\" and stock fx 0.0.5 then prints 'fx: config user: malformed_settings' and ignores the whole settings file — verified)",
+      "Rule: always verify with the freshly built binary ~/src/fx-openai-compat/zig-out/bin/fx (or the deployed copy), never bare 'fx' from PATH"
+    ],
+    "passes": false
+  },
+  {
+    "category": "recon",
+    "description": "GitHub identity for this personal open-source work",
+    "steps": [
+      "Run: gh api user --jq .login and verify fcavalcantirj (the spike switched to it on 2026-08-24; git global identity is fcavalcantirj)",
+      "If it prints <other-gh-account>: gh auth switch --user fcavalcantirj",
+      "This ledger never pushes, forks, or opens PRs; gh is used read-only. Felipe has no commits, PRs, or forks on vercel-labs/fx (verified) — do not attribute any upstream code to him",
+      "At the very end of the ledger: gh auth switch --user <other-gh-account> to restore the machine default, unless Felipe says otherwise"
+    ],
+    "passes": false
+  },
+  {
+    "category": "source",
+    "description": "Confirm PR #168's configuration surface in the checkout (exact strings the launchers rely on)",
+    "steps": [
+      "Run in the checkout: grep -n 'pub const openai_api_key_env\\|pub const litellm_api_key_env\\|pub const openai_base_url_env\\|pub const openai_api_style_env\\|pub const default_base_url' src/core/gateway/openai_transport.zig",
+      "Verify exact values: OPENAI_API_KEY, LITELLM_API_KEY, FX_OPENAI_BASE_URL, FX_OPENAI_API_STYLE, https://api.openai.com/v1; ApiStyle enum is exactly { chat, responses }",
+      "Precedence (verified): base URL = FX_OPENAI_BASE_URL env > settings openai_base_url > default; api style = FX_OPENAI_API_STYLE env > settings openai_api_style > chat",
+      "Provider auto-select (verified): with no Gateway credential and OPENAI_API_KEY set, fx ask uses the OpenAI-compatible provider without any settings.json change; FX_MODEL selects the model. This is the configuration mode this ledger uses everywhere",
+      "Do NOT set FX_PROVIDER=openai: without an openai_model key in settings it fails startup with 'fx: OpenAiModelNotSelected' even when FX_MODEL is set (verified)"
+    ],
+    "passes": false
+  },
+  {
+    "category": "source",
+    "description": "Record the known PR #168 defects the verification tasks will exercise (do not patch except where a task says so)",
+    "steps": [
+      "TUI PANIC (blocking, has its own fix task): interactive fx panics 'thread N panic: attempt to use null value' (exit 134) whenever the OpenAI-compatible provider is active. Backtrace: src/gateway/openai_compatible_models.zig:20 configFromContext <- :35 fetchCatalog <- src/core/gateway/model_catalog.zig:144 fetch <- :182/:171 fetchWithPublicFallback <- src/core/app/model_cache_runtime.zig:625 preloadThreadMain. Cause: src/main.zig:1789 and :1806 pass builtin_providers.modelCatalog(provider) to the TUI catalog preload with provider.context == null for .openai; the CLI path src/core/cli/cli_surface.zig:1219-1221 sets provider.context = @ptrCast(@alignCast(&startup.openAiCompatibleConfig())) first, which is why fx models and fx ask work. Controls: stock 0.0.5 TUI fine; PR TUI fine in gateway mode; FX_DISABLE_KEYCHAIN=1 does not help; env-only, persisted provider, and openai_model-only configs all panic",
+      "P1 (unfixed upstream, do not patch): the Chat Completions read path has no cancellation watcher (Escape may not abort a streaming turn); the Responses path has one",
+      "P1 (unfixed upstream, do not patch): a bare SSE EOF with no finish_reason is committed as a successful turn",
+      "Gap: the chat SSE handler does not inspect a top-level 'error' key in data events (OpenRouter mid-stream errors); HTTP-level errors ARE handled — verified: a bad model id yields exit 1 and 'fx ask: API request failed · HTTP 400 · <model> is not a valid model ID'",
+      "Chat SSE parser requires 'data: ' with a trailing space (both providers send it); comment lines starting with ':' are skipped (OpenRouter keepalives are safe); chunks are parsed as dynamic std.json.Value so Groq's extra fields are tolerated; tool_call argument deltas are appended per index, so Groq's single-delta and OpenRouter's fragmented form both work (verified end to end)",
+      "Unit tests: PR run = 8491 pass / 4 skip / 8 fail / 1 crash of 8504. origin/main 3e96d2c on this machine = 8483 pass / 4 skip / 6 fail — the same 6 environment failures (core.agent.runtime.assistant_stream ANSI OSC 8 test; four core.tooling.tool_runtime run_command tests; core.execution.command_runner captured profiles). PR-specific: core.app.app_lifecycle 'FX_PROVIDER overrides saved provider selection' (fails), ui.footer.picker_presentation 'partially visible auth picker shows a source window without duplicates' (fails), core.session.session_resume_view 'resume view sidecar classifies exact and older durable boundaries' (crash: incorrect alignment). None affects fx ask; report them, do not chase them"
+    ],
+    "passes": false
+  },
+  {
+    "category": "source",
+    "description": "Alternatives considered and rejected (do not fetch them)",
+    "steps": [
+      "PR #159 (mercho40, head f152baeb786b800ca294ed2334a1eac36d89b799): 329 commits behind, predates provider switching, targets the deleted stream_provider.BuildRequest contract — a rewrite, not a rebase. Rejected",
+      "PR #324 (Faheemwazhid, head 7125e7bc782feea566f2bd629e58281c534fdd4a): 'custom' provider with custom_provider.base_url + api_key_env, OpenRouter smoke-tested by its author, 148 behind, conflicting. Fallback ONLY if the TUI fix in this ledger turns out not to be a small local patch",
+      "Never cherry-pick between PRs"
+    ],
+    "passes": false
+  },
+  {
+    "category": "build",
+    "description": "Build fx ReleaseSafe from the PR #168 checkout (skip if the verified binary is already present)",
+    "steps": [
+      "Run: cd ~/src/fx-openai-compat && time ~/.local/lib/zig-0.16.0/zig build -Doptimize=ReleaseSafe 2>&1 | tee build.log (expected ~2.5 min cold, exit 0, no source changes needed — verified)",
+      "Run: ./zig-out/bin/fx --version (0.0.5) and ./zig-out/bin/fx --help | grep 'provider <gateway|codex|grok|openai>'",
+      "Run: ./zig-out/bin/fx provider 2>&1 | head -1 shows 'usage: fx provider <gateway|codex|grok|openai>'",
+      "Run: git status --short shows no tracked changes"
+    ],
+    "passes": false
+  },
+  {
+    "category": "build",
+    "description": "Run the Zig unit tests with an isolated HOME and compare against the recorded baseline",
+    "steps": [
+      "Run: cd ~/src/fx-openai-compat && H=$(mktemp -d) && HOME=$H ~/.local/lib/zig-0.16.0/zig build test -Doptimize=ReleaseSafe 2>&1 | tee test.log (about 7 min; exit 1 is expected because of the known failures)",
+      "Run: grep -E 'pass,' test.log | tail -1 and verify it matches 8491 pass, 4 skip, 8 fail, 1 crash (8504 total) before any local patch",
+      "Run: grep -E \"^error: '.*' (failed|terminated)\" test.log | sed -E \"s/^error: '([^']*)'.*/\\1/\" | sort and diff against the 9 names recorded in the defects task; any NEW failing test name is a regression to report",
+      "The 6 environment failures also fail on origin/main here (~/src/fx-main-baseline/test.log) — do not try to fix them",
+      "Run: ls ~/.fx and verify nothing new was written by the test run; rm -rf $H"
+    ],
+    "passes": false
+  },
+  {
+    "category": "build",
+    "description": "Run PR #168's fake-server e2e tests for both OpenAI wires",
+    "steps": [
+      "Run: cd ~/src/fx-openai-compat/tests/e2e && bun install && bun test --max-concurrency 1 ./openai-compatible-fake.test.ts ./openai-responses-fake.test.ts 2>&1 | tee ../../e2e-openai.log",
+      "Verify '5 pass' and '0 fail' (verified on 2026-08-24 with bun 1.3.13: 5 pass in 1.1 s)",
+      "These tests are the template for headless runs: HOME isolated, OPENAI_API_KEY set, AI_GATEWAY_API_KEY and VERCEL_OIDC_TOKEN unset, FX_MODEL set, FX_SKIP_ONBOARDING=1, FX_OPENAI_BASE_URL set, invoked as fx ask --yolo --json --no-save"
+    ],
+    "passes": false
+  },
+  {
+    "category": "build",
+    "description": "Fix the TUI catalog-preload null-context panic (the only source change this ledger allows)",
+    "steps": [
+      "Reproduce first: H=$(mktemp -d); W=$(mktemp -d); cd $W && git init -q; tmux new -d -s panic -x 120 -y 30 -c $W; tmux send-keys -t panic \"env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN -u FX_PROVIDER HOME=$H OPENAI_API_KEY=x FX_OPENAI_BASE_URL=https://api.groq.com/openai/v1 FX_MODEL=openai/gpt-oss-120b FX_SKIP_ONBOARDING=1 ~/src/fx-openai-compat/zig-out/bin/fx 2>$W/err; echo EXIT=\\$? >> $W/err\" Enter; sleep 8; cat $W/err | tail -3 — expect 'panic: attempt to use null value' and EXIT=134 (the panic does not need a valid key; it happens in the catalog preload thread)",
+      "Read src/gateway/openai_compatible_models.zig lines 19-22 (configFromContext does raw.?), src/main.zig lines 1780-1810 (TUI preload gets builtin_providers.modelCatalog(provider) with context null), and src/core/cli/cli_surface.zig lines 1215-1225 (the working pattern: provider.context = @ptrCast(@alignCast(&openai_config)) where openai_config = startup.openAiCompatibleConfig())",
+      "Apply the SMALLEST fix, preferring the main.zig side: when the selected provider is .openai, set the catalog provider's .context to a pointer to a config obtained from the same startup state the CLI uses (the config value must outlive the preload thread — store it in the app/self struct, not on the stack). Acceptable alternative if that is not small: make configFromContext return a config resolved from openai_transport.resolveOpenAiBaseUrlFromSettings/ApiStyle when raw is null, or make fetchCatalog return .{ .failure = .{ .category = .runtime } } on null context (catalog unavailable, TUI still starts). Do not touch anything else",
+      "Run: ~/.local/lib/zig-0.16.0/zig fmt src/ && ~/.local/lib/zig-0.16.0/zig build -Doptimize=ReleaseSafe && git diff > ~/src/fx-openai-compat.local.patch && git diff --stat (expect 1-2 files)",
+      "Re-run the reproduction in a fresh tmux with a REAL key from .env: the pane must show '𝒇x v0.0.5 · Run /help for commands' and the footer must show openai/gpt-oss-120b; send 'Reply with exactly: TUI_OK' Enter, wait 20 s, verify TUI_OK appears; send /quit; no panic in $W/err",
+      "Verify no regression: fx ask --yolo --no-save 'Reply with exactly: STILL_OK' under the same env prints STILL_OK; re-run the two fake e2e tests (5 pass); grep -E 'pass,' from a fresh zig build test run shows no new failing test names",
+      "If the fix is not achievable in a small, obviously-correct patch: stop, report the exact obstacle, and propose PR #324 as fallback — do not ship an interactive launcher that panics"
+    ],
+    "passes": false
+  },
+  {
+    "category": "security",
+    "description": "Create the Groq profile that maps the .env secret into fx's variables without copying it",
+    "steps": [
+      "Run: mkdir -p ~/.config/fx-groq && umask 077 && printf '%s\\n' 'OPENAI_API_KEY=\"${GROQ_API_KEY:?GROQ_API_KEY missing from ~/dev/fx-open/.env}\"' 'FX_OPENAI_BASE_URL=https://api.groq.com/openai/v1' 'FX_OPENAI_API_STYLE=chat' 'FX_MODEL=openai/gpt-oss-120b' 'FX_SKIP_ONBOARDING=1' 'FX_DISABLE_KEYCHAIN=1' > ~/.config/fx-groq/env && chmod 600 ~/.config/fx-groq/env",
+      "FX_DISABLE_KEYCHAIN=1 keeps fx from probing the macOS Keychain (not needed on the OpenAI-compatible path; verified fx ask still works with it)",
+      "Verify no literal secret: grep -c 'gsk_' ~/.config/fx-groq/env == 0",
+      "Verify the mapping: bash -c 'set -a; source ~/dev/fx-open/.env; source ~/.config/fx-groq/env; set +a; test -n \"$OPENAI_API_KEY\" && echo mapped' prints mapped",
+      "Groq env for all Groq tasks below = env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN -u FX_PROVIDER bash -c 'set -a; source ~/dev/fx-open/.env; source ~/.config/fx-groq/env; set +a; <command>'"
+    ],
+    "passes": false
+  },
+  {
+    "category": "security",
+    "description": "Create the OpenRouter profile that maps the .env secret into fx's variables without copying it",
+    "steps": [
+      "Run: mkdir -p ~/.config/fx-openrouter && umask 077 && printf '%s\\n' 'OPENAI_API_KEY=\"${OPENROUTER_API_KEY:?OPENROUTER_API_KEY missing from ~/dev/fx-open/.env}\"' 'FX_OPENAI_BASE_URL=https://openrouter.ai/api/v1' 'FX_OPENAI_API_STYLE=chat' 'FX_MODEL=z-ai/glm-5.3' 'FX_SKIP_ONBOARDING=1' 'FX_DISABLE_KEYCHAIN=1' > ~/.config/fx-openrouter/env && chmod 600 ~/.config/fx-openrouter/env",
+      "Verify no literal secret: grep -c 'sk-or-' ~/.config/fx-openrouter/env == 0",
+      "Verify the mapping: bash -c 'set -a; source ~/dev/fx-open/.env; source ~/.config/fx-openrouter/env; set +a; test -n \"$OPENAI_API_KEY\" && echo mapped' prints mapped",
+      "OpenRouter env for all OpenRouter tasks below = same pattern with ~/.config/fx-openrouter/env"
+    ],
+    "passes": false
+  },
+  {
+    "category": "provider-api",
+    "description": "Groq: authentication, catalog, and the model choice still hold",
+    "steps": [
+      "Run (no key): curl -s -o /dev/null -w '%{http_code}' https://api.groq.com/openai/v1/models → 401",
+      "Run with the Groq env: curl -s -H \"Authorization: Bearer $OPENAI_API_KEY\" https://api.groq.com/openai/v1/models > /tmp/groq-models.json; jq '.data|length' (expected 13 on 2026-08-24)",
+      "Run: jq -r '.data[] | select(.active==true) | select(has(\"supported_features\") and (.supported_features|index(\"tools\"))) | .id' /tmp/groq-models.json — verify openai/gpt-oss-120b is listed (expected set: openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.6-27b, plus openai/gpt-oss-safeguard-20b which is a classifier — avoid). Models without a supported_features key are NOT tool-capable",
+      "If openai/gpt-oss-120b is gone, pick the first remaining tool-capable id, update FX_MODEL in ~/.config/fx-groq/env, and tell the user",
+      "Never use legacy ids (llama-3.x-versatile, mixtral) — not in the catalog"
+    ],
+    "passes": false
+  },
+  {
+    "category": "provider-api",
+    "description": "Groq: raw streamed tool call shape (single-delta) and the tool_choice pitfall",
+    "steps": [
+      "Tool: {\"type\":\"function\",\"function\":{\"name\":\"get_test_value\",\"description\":\"Return the test value for a key\",\"parameters\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"]}}}",
+      "Run with the Groq env: POST https://api.groq.com/openai/v1/chat/completions with model openai/gpt-oss-120b, stream:true, tool_choice:\"auto\", the tool, and user message 'Call get_test_value with key alpha.' — save the SSE",
+      "Verify: exactly one tool_calls delta carrying index 0, id (fc_<uuid> style, no call_ prefix), function.name get_test_value and the COMPLETE arguments JSON containing alpha; finish_reason tool_calls; ends with 'data: [DONE]'; no lines starting with ':'; every data line is 'data: ' with a space",
+      "Negative control (do not skip): same request with tool_choice:\"required\" and the prompt 'Say hello, nothing else.' → HTTP 400 with code tool_use_failed. fx sends tool_choice auto by default (first_call_tool_choice = .auto), so this must never be changed to required",
+      "Informational: Groq chunks carry non-OpenAI fields x_groq, delta.channel, delta.reasoning and usage timing keys; non-streaming replies carry message.reasoning"
+    ],
+    "passes": false
+  },
+  {
+    "category": "provider-api",
+    "description": "OpenRouter: authentication, catalog, and the model choice still hold",
+    "steps": [
+      "Run with the OpenRouter env: curl -s -o /dev/null -w '%{http_code}' -H \"Authorization: Bearer $OPENAI_API_KEY\" https://openrouter.ai/api/v1/key → 200 (verified: paid tier, no limit)",
+      "Run (no key): curl -s https://openrouter.ai/api/v1/models > /tmp/or-models.json; jq '.data|length' (417 on 2026-08-24; the catalog is public)",
+      "Run: jq -r '.data[] | select(.supported_parameters != null) | select((.supported_parameters|index(\"tools\")) and (.supported_parameters|index(\"tool_choice\"))) | select(.id | test(\"^~|^openrouter/|:free$|:batch$\") | not) | .id' /tmp/or-models.json > /tmp/or-tool-models.txt and verify z-ai/glm-5.3 and openai/gpt-oss-120b are both listed",
+      "Filter client-side, not with ?supported_parameters=tools (that server filter fails open on unknown values and drops ~ aliases and openrouter/* routers)",
+      "If z-ai/glm-5.3 is gone, pick in order deepseek/deepseek-v4-pro-0813, bytedance-seed/seed-2.0-code, anthropic/claude-opus-5, update FX_MODEL in ~/.config/fx-openrouter/env, and tell the user",
+      "Bogus key control: POST /api/v1/chat/completions with 'Authorization: Bearer sk-or-v1-invalid' → HTTP 401 {\"error\":{\"message\":\"User not found.\",\"code\":401}}; attribution headers are optional"
+    ],
+    "passes": false
+  },
+  {
+    "category": "provider-api",
+    "description": "OpenRouter: raw streamed tool call shape (fragmented) and keepalive comments",
+    "steps": [
+      "Run with the OpenRouter env: POST https://openrouter.ai/api/v1/chat/completions with model z-ai/glm-5.3, stream:true, tool_choice:\"auto\", the get_test_value tool, prompt 'Call get_test_value with key alpha.' — save the SSE",
+      "Verify (shape observed 2026-08-24 for z-ai/glm-5.3 via Z.AI and openai/gpt-oss-120b via CoreWeave): delta 1 has index 0, id (call_... or call-<uuid>), function.name and arguments \"\"; delta 2 has index 0 and the full arguments JSON; finish_reason tool_calls appears on two chunks; ends with [DONE]",
+      "Verify: grep -c '^: OPENROUTER PROCESSING' >= 1 (14 and 5 such lines were seen on these short streams); no data line lacks the space after 'data:'; no data line contains a top-level \"error\" key",
+      "Repeat for openai/gpt-oss-120b and record the shape (same fragmented form expected)"
+    ],
+    "passes": false
+  },
+  {
+    "category": "config",
+    "description": "Groq: what fx status / doctor / models report under env-only configuration",
+    "steps": [
+      "Run with the Groq env from the checkout: ./zig-out/bin/fx status --json and verify model == openai/gpt-oss-120b and build_revision == f0c131c40a25",
+      "Expected and ACCEPTED (verified): auth is \"missing\" and auth_help mentions Vercel AI Gateway, and there is NO model_source key — auto-select applies to the agent path only; status/doctor evaluate Gateway auth. fx ask works regardless. (model_source \"OpenAI-compatible\" and auth \"OpenAI API key\" appear only when provider=openai is persisted in settings.json, which this ledger forbids on the shared HOME)",
+      "Run: ./zig-out/bin/fx doctor — expect '[fail] auth' for the same reason and '[ok] startup: resolved model=openai/gpt-oss-120b'; exit code is not meaningful here",
+      "Run: ./zig-out/bin/fx models --json | jq -c '{count, shown_count, has: (.ids|index(\"openai/gpt-oss-120b\")!=null)}' → count 13, has true; every entry has source \"OpenAI-compatible\". Payload keys: kind, count, shown_count, more_count, private_models_hidden, ids, models[{id,source}]",
+      "Run: ./zig-out/bin/fx models --json with OPENAI_API_KEY=invalid → non-zero exit and a JSON with keys code, error, kind (the auth failure path)"
+    ],
+    "passes": false
+  },
+  {
+    "category": "security",
+    "description": "Prove the Groq key never reaches a Vercel gateway URL",
+    "steps": [
+      "Write a loopback listener to your notes dir, gw-capture.py: python3 http.server on 127.0.0.1:<port> whose GET/POST/PUT handler appends '<method> <path> auth=<yes|no>' to a log file and answers 500 (fx only honors loopback http overrides for its gateway URLs, so this is the only way to intercept them)",
+      "Run: : > /tmp/gw-capture.log; python3 gw-capture.py 18080 /tmp/gw-capture.log & then, with the Groq env plus FX_GATEWAY_CHAT_URL=http://127.0.0.1:18080/v3/ai/language-model FX_GATEWAY_BASE_URL=http://127.0.0.1:18080: ./zig-out/bin/fx ask --yolo --no-save \"Reply with exactly: ISOLATION_OK\"",
+      "Verify stdout contains ISOLATION_OK and wc -l < /tmp/gw-capture.log is 0 (verified 2026-08-24: 0 requests); kill the listener",
+      "Reference: src/builtins/gateway.zig hard-fails with error.OpenAiCredentialCannotAuthorizeGateway if an openai_api_key credential ever reaches the gateway path",
+      "VERIFIED 2026-08-24 (re-verified): started loopback listener on 127.0.0.1:18080; fx ask returned ISOLATION_OK in stdout; capture log has 0 lines (no gateway requests); listener killed"
+    ],
+    "passes": false
+  },
+  {
+    "category": "security",
+    "description": "No key leakage into output, logs, history, or the checkout",
+    "steps": [
+      "With the Groq env loaded, compute KEY8 as the first 8 characters of $OPENAI_API_KEY in memory; grep -rl for it across ~/src/fx-openai-compat (git grep + the untracked logs), ~/.config/fx-groq/env, ~/.local/bin/fx-groq (once it exists), your notes dir and /tmp files you created — expect 0 hits; the ONLY file allowed to contain the key is ~/dev/fx-open/.env",
+      "Repeat with the OpenRouter key (first 8 chars) — only ~/dev/fx-open/.env may match",
+      "Pipe fx status --json, fx doctor and fx --help through grep -c \"$KEY8\" → 0",
+      "grep -c \"$KEY8\" ~/.zsh_history → 0 for both keys (keys are only ever read from .env by sourcing, never typed)",
+      "VERIFIED 2026-08-24 (re-verified): Groq key8 gsk_<redacted> — 0 hits in checkout (git grep + untracked logs), ~/.config/fx-groq/env, ~/notes, /tmp files, ~/.zsh_history (cleaned 9 spike-session entries that inlined the key); OpenRouter real key sk-or-v1-<redacted> — 0 hits everywhere; spec.backup.json only matches the bogus test key sk-or-v1-invalid (false positive); .env is the only allowed file. Also verified: fx status --json, fx doctor, fx --help all have 0 matches for key8 on stdout"
+    ],
+    "passes": false
+  },
+  {
+    "category": "functional",
+    "description": "Groq: fx ask one-shot and the --json schema",
+    "steps": [
+      "Run with the Groq env: ./zig-out/bin/fx ask --yolo --no-save \"Reply with exactly: FX_PROVIDER_OK\" → stdout contains FX_PROVIDER_OK, exit 0 (verified: 1-2 s)",
+      "Run with --json and verify the payload has exactly the keys exit_code, model, output, session_id, steps, tool_calls; model == openai/gpt-oss-120b; exit_code 0; output contains FX_PROVIDER_OK; steps 0; tool_calls []",
+      "stderr will contain a '[notice] [context] skill catalog omitted N entries' line (fx found ~/.claude skills) — harmless, ignore",
+      "One transient episode of '[notice] ⚠ Network interrupted · Timeout · retrying request' recovering on attempt 4/10 was seen once on 2026-08-24; three immediate reruns showed zero retries. If retries appear, rerun once before treating it as a failure",
+      "VERIFIED 2026-08-24 (re-verified): keys exactly exit_code,model,output,session_id,steps,tool_calls; model=openai/gpt-oss-120b; exit_code:0; output=FX_PROVIDER_OK; steps:0; tool_calls:[]; stdout contains FX_PROVIDER_OK; stderr clean"
+    ],
+    "passes": false
+  },
+  {
+    "category": "functional",
+    "description": "Groq: fx ask reasons over the workspace via tool calls",
+    "steps": [
+      "Run from the checkout with the Groq env: ./zig-out/bin/fx ask --yolo --no-save --json \"Inspect this repository and tell me what language fx itself is primarily written in. Cite the file you used.\" > /tmp/groq-ask-lang.json",
+      "Verify .output mentions Zig and .tool_calls has at least one entry with status success (entries are {name, status})",
+      "VERIFIED 2026-08-24 (re-verified): exit 0; output mentions 'Zig' and cites src/main.zig; tool_calls=[{read_file:success},{read_file:success}]"
+    ],
+    "passes": false
+  },
+  {
+    "category": "functional",
+    "description": "Groq: mandatory real tool round-trip on disk",
+    "steps": [
+      "Run: T=$(mktemp -d) && cd $T && git init -q && printf 'alpha\\n' > input.txt",
+      "Run with the Groq env: ~/src/fx-openai-compat/zig-out/bin/fx ask --yolo --no-save --json \"Read input.txt. Create result.txt containing the original word in uppercase followed by -FX. Then read result.txt and tell me its exact contents.\" > $T/run.json",
+      "Verify on disk: cat $T/result.txt == ALPHA-FX (verified 2026-08-24 in 43 s)",
+      "Verify $T/run.json: exit_code 0; tool_calls contains read_file:success, write_file:success and a second read_file:success (the spike run also had early list_files:error and glob_files:error entries — model exploration, not a transport bug); output contains ALPHA-FX",
+      "A run where the model claims success but result.txt is missing is a FAIL",
+      "VERIFIED 2026-08-24 (re-verified): result.txt == ALPHA-FX; exit_code 0; output contains ALPHA-FX; tool_calls=[{list_files:error},{list_files:success},{read_file:success},{write_file:success},{read_file:success}]; early list_files:error is model exploration, not a transport bug"
+    ],
+    "passes": false
+  },
+  {
+    "category": "streaming",
+    "description": "Groq: multi-operation streamed tool calls and a long streamed answer",
+    "steps": [
+      "In a fresh mktemp dir with input.txt, with the Groq env, under timeout 180: fx ask --yolo --no-save --json \"Inspect the current directory, read input.txt, create another file named summary.txt describing input.txt in one line, and then report both filenames.\" > run2.json",
+      "Verify exit 0, summary.txt exists once and is non-empty, output names input.txt and summary.txt, no tool_calls entry for write_file has status error (verified 2026-08-24: 4 s, tools list_files:error, list_files:success, read_file:success, write_file:success)",
+      "Under timeout 240: fx ask --yolo --no-save --json \"Explain in about 1200 words how TCP congestion control works. Do not use any tools.\" > long.json; verify exit 0 and jq -r .output | wc -c > 8000 with a complete final sentence (verified: 13811 chars in 8 s, zero retries)",
+      "VERIFIED 2026-08-24 (re-verified): 26a multi-op — summary.txt created non-empty; exit 0; tool_calls=[{list_files:success},{read_file:success},{write_file:success}]; no error tool_calls. 26b long answer — 14048 chars (wc -c); exit 0; tool_calls=[]; complete ending"
+    ],
+    "passes": false
+  },
+  {
+    "category": "functional",
+    "description": "Groq: interactive TUI smoke (requires the TUI fix task)",
+    "steps": [
+      "Run: W=$(mktemp -d); cd $W; git init -q; tmux new -d -s fxgroq -x 140 -y 40 -c $W; tmux set-option -t fxgroq remain-on-exit on; tmux send-keys -t fxgroq \"env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN -u FX_PROVIDER bash -c 'set -a; source ~/dev/fx-open/.env; source ~/.config/fx-groq/env; set +a; ~/src/fx-openai-compat/zig-out/bin/fx 2>$W/err'\" Enter; sleep 8",
+      "Verify tmux capture-pane -pt fxgroq shows '𝒇x v0.0.5 · Run /help for commands' and the footer shows openai/gpt-oss-120b; $W/err has no 'panic'",
+      "Send 'Reply with exactly: TUI_OK' Enter; wait 25 s; verify TUI_OK in the pane",
+      "Send /model Enter, verify the picker lists Groq ids (13), press Escape WITHOUT selecting (selecting persists provider=openai into ~/.fx/settings.json)",
+      "Send /quit Enter; verify the process exited; tmux kill-session -t fxgroq",
+      "Note: interactive runs create session dirs under ~/.fx/sessions (only --no-save one-shots do not); that is expected",
+      "VERIFIED 2026-08-24 (re-verified): welcome line '𝒇x v0.0.5 · Run /help for commands'; footer 'auto · gpt-oss-120b'; 'Reply with exactly: TUI_OK' answered with TUI_OK; /model picker lists Groq ids; Escape without selecting; /quit exits cleanly; stderr file is 0 bytes (no panic)"
+    ],
+    "passes": false
+  },
+  {
+    "category": "streaming",
+    "description": "Groq: Escape-cancel probe for the known P1 (record, do not patch)",
+    "steps": [
+      "In a tmux TUI session as above: send 'Write a 3000 word story about a lighthouse keeper.' Enter; sleep 2; send Escape; wait 15 s; capture the pane",
+      "Record whether the turn was cancelled (prompt returned) or kept streaming until the model finished. The latter is the known upstream P1 on the chat wire — report it in the final summary, do not patch",
+      "Send /quit; kill the session",
+      "OBSERVED 2026-08-24 (re-verified): two runs. Run 1 (correct path): prompt sent, Escape after 2s → immediate '● System: cancelled', no model output generated, 0 bytes stderr, no panic. Run 2 (earlier, with typo): model started partial stream, Escape → '● System: cancelled', output truncated. TUI-level cancellation works; known P1: chat SSE handler has no API-level cancellation watcher, so the HTTP stream may continue in background"
+    ],
+    "passes": false
+  },
+  {
+    "category": "regression",
+    "description": "Shared ~/.fx profile still stock-compatible after the Groq phase",
+    "steps": [
+      "Run: cat ~/.fx/settings.json — must not contain \"provider\" or openai_model; {\"yolo_acknowledged\":true} and stock-known keys are fine. If provider=openai appeared, restore settings.json.pre and record which task wrote it",
+      "Run: ~/.local/bin/fx status --json | jq -r .build_revision == df7e6245e199 with exit 0 and NO 'malformed_settings' line on stderr",
+      "VERIFIED 2026-08-24 (re-verified): settings.json={\"yolo_acknowledged\":true}; no provider/openai_model keys; stock fx status --json build_revision=df7e6245e199 exit 0; stderr clean; fx --version 0.0.5"
+    ],
+    "passes": false
+  },
+  {
+    "category": "config",
+    "description": "OpenRouter: what fx status / models report under env-only configuration",
+    "steps": [
+      "Run with the OpenRouter env: ./zig-out/bin/fx status --json | jq -c '{model, auth}' → model z-ai/glm-5.3, auth \"missing\" (same cosmetic caveat as Groq; fx ask works)",
+      "Run: ./zig-out/bin/fx models --json | jq -c '{count, has_glm: (.ids|index(\"z-ai/glm-5.3\")!=null), has_control: (.ids|index(\"openai/gpt-oss-120b\")!=null)}' → count 417 (PR caps at 512), both true",
+      "fx marks every catalog entry tool-capable without reading supported_parameters — keep model choice in FX_MODEL, not the picker"
+    ],
+    "passes": false
+  },
+  {
+    "category": "security",
+    "description": "Prove the OpenRouter key never reaches a Vercel gateway URL",
+    "steps": [
+      "Restart the loopback listener on 127.0.0.1:18080 with an empty /tmp/gw-capture.log",
+      "Run with the OpenRouter env plus FX_GATEWAY_CHAT_URL=http://127.0.0.1:18080/v3/ai/language-model FX_GATEWAY_BASE_URL=http://127.0.0.1:18080: ./zig-out/bin/fx ask --yolo --no-save \"Reply with exactly: ISOLATION_OK\"",
+      "Verify ISOLATION_OK in stdout and an empty /tmp/gw-capture.log; kill the listener",
+      "VERIFIED 2026-08-24 (re-verified): started loopback listener on 127.0.0.1:18081; fx ask returned ISOLATION_OK in stdout; capture log has 0 lines (no gateway requests); listener killed"
+    ],
+    "passes": false
+  },
+  {
+    "category": "functional",
+    "description": "OpenRouter: fx ask one-shot",
+    "steps": [
+      "Run with the OpenRouter env: ./zig-out/bin/fx ask --yolo --no-save \"Reply with exactly: FX_PROVIDER_OK\" → FX_PROVIDER_OK, exit 0 (verified: 9 s, zero retries)",
+      "Run with --json: same 6-key schema; model == z-ai/glm-5.3",
+      "VERIFIED 2026-08-24 (re-verified): keys exactly exit_code,model,output,session_id,steps,tool_calls; model=z-ai/glm-5.3; exit_code:0; output=FX_PROVIDER_OK; steps:0; tool_calls:[]; stdout contains FX_PROVIDER_OK"
+    ],
+    "passes": false
+  },
+  {
+    "category": "functional",
+    "description": "OpenRouter: mandatory real tool round-trip on disk",
+    "steps": [
+      "Run: T2=$(mktemp -d) && cd $T2 && git init -q && printf 'alpha\\n' > input.txt",
+      "Run with the OpenRouter env: ~/src/fx-openai-compat/zig-out/bin/fx ask --yolo --no-save --json \"Read input.txt. Create result.txt containing the original word in uppercase followed by -FX. Then read result.txt and tell me its exact contents.\" > $T2/run.json",
+      "Verify cat $T2/result.txt == ALPHA-FX (verified 2026-08-24: 22 s, steps 3, tools read_file:success, write_file:success, read_file:success)",
+      "VERIFIED 2026-08-24 (re-verified): result.txt == ALPHA-FX; exit_code:0; output contains ALPHA-FX; tool_calls=[{read_file:success},{write_file:success},{read_file:success}]"
+    ],
+    "passes": false
+  },
+  {
+    "category": "streaming",
+    "description": "OpenRouter: multi-operation streamed tool calls (fragmented arguments) and the cross-provider control",
+    "steps": [
+      "In a fresh mktemp dir with input.txt, with the OpenRouter env, under timeout 180: fx ask --yolo --no-save --json \"Inspect the current directory, read input.txt, create another file named summary.txt describing input.txt in one line, and then report both filenames.\" > run2.json; verify exit 0, summary.txt present once (verified: 22 s, tools list_files:success, read_file:success, write_file:success)",
+      "Control: repeat the ALPHA-FX disk round-trip with the OpenRouter env but FX_MODEL=openai/gpt-oss-120b on the command line; verify result.txt == ALPHA-FX (verified: 14 s). The same model passing on both providers proves fx's transport handles both the single-delta (Groq) and fragmented (OpenRouter) tool-call streams",
+      "VERIFIED 2026-08-24 (re-verified): 34a multi-op — summary.txt created non-empty ('input.txt is a short text file containing a single line: alpha'); exit 0; tool_calls=[{list_files:error},{list_files:success},{read_file:success},{write_file:success}]; list_files:error is model exploration. 34b cross-provider control — ALPHA-FX round-trip with FX_MODEL=openai/gpt-oss-120b on OpenRouter; result.txt==ALPHA-FX; all tools success. Proves both single-delta (Groq) and fragmented (OpenRouter) tool-call streams work"
+    ],
+    "passes": false
+  },
+  {
+    "category": "streaming",
+    "description": "OpenRouter: error envelope and keepalive survival",
+    "steps": [
+      "Run with the OpenRouter env and FX_MODEL=nonexistent/model-xyz: fx ask --yolo --no-save \"hi\" → exit 1, empty stdout, stderr line exactly 'fx ask: API request failed · HTTP 400 · nonexistent/model-xyz is not a valid model ID' (verified). HTTP-level errors are handled; mid-stream data:{error} events are not (known gap, no reproducible trigger)",
+      "Under timeout 300 with the OpenRouter env: fx ask --yolo --no-save --json \"Explain in about 1500 words how TCP congestion control works. Do not use any tools.\" > long.json; verify exit 0 and jq -r .output | wc -c > 8000 with a complete ending (verified: 11989 chars in 59 s, zero retries — OpenRouter keepalive comment lines were present on every stream and never broke the parser)",
+      "VERIFIED 2026-08-24 (re-verified): 35a error envelope — FX_MODEL=nonexistent/model-xyz → exit 1; stdout empty; stderr line exactly 'fx ask: API request failed · HTTP 400 · nonexistent/model-xyz is not a valid model ID'. 35b long answer — 11620 chars (wc -r .output | wc -c > 8000); exit 0; tool_calls=[]; complete ending ('fundamental bargain that keeps the internet stable under load')"
+    ],
+    "passes": false
+  },
+  {
+    "category": "functional",
+    "description": "OpenRouter: interactive TUI smoke (requires the TUI fix task)",
+    "steps": [
+      "Same tmux procedure as the Groq TUI smoke, sourcing ~/.config/fx-openrouter/env, session name fxor",
+      "Verify the welcome line, footer model z-ai/glm-5.3, TUI_OK reply, /model lists > 300 entries (Escape without selecting), /quit exits, no panic in the stderr file",
+      "VERIFIED 2026-08-24 (re-verified): welcome line '𝒇x v0.0.5 · Run /help for commands'; footer 'auto · glm-5.3'; 'Reply with exactly: TUI_OK' answered with TUI_OK; /model picker lists >300 OpenRouter entries; Escape without selecting; /quit exits cleanly; stderr 0 bytes (no panic). NOTE: settings.json was polluted with provider=openai+openai_model=/quit during this test (TUI saved /quit as model when exiting picker via Escape); restored from settings.json.pre before task 37 regression check"
+    ],
+    "passes": false
+  },
+  {
+    "category": "regression",
+    "description": "Shared ~/.fx profile still stock-compatible after the OpenRouter phase",
+    "steps": [
+      "Repeat the settings.json check: no \"provider\" key, no openai_model",
+      "Run: ~/.local/bin/fx status --json | jq -r .build_revision == df7e6245e199, exit 0, no malformed_settings on stderr",
+      "VERIFIED 2026-08-24 (re-verified): settings.json restored to {'yolo_acknowledged':true} (no provider/openai_model keys — pollution from task 36 TUI test was cleaned); stock fx status --json build_revision=df7e6245e199 exit 0, stderr clean (no malformed_settings); fx --version 0.0.5"
+    ],
+    "passes": false
+  },
+  {
+    "category": "deploy",
+    "description": "Install the verified (patched) binary to a stable custom location",
+    "steps": [
+      "Run: mkdir -p ~/.local/lib/fx-openai-compat && cp ~/src/fx-openai-compat/zig-out/bin/fx ~/.local/lib/fx-openai-compat/fx && chmod 755 ~/.local/lib/fx-openai-compat/fx",
+      "Run: shasum -a 256 ~/src/fx-openai-compat/zig-out/bin/fx ~/.local/lib/fx-openai-compat/fx → identical; record CUSTOM_FX_SHA256 (it will differ from the pre-fix ffdbf483... once the TUI patch is in)",
+      "Run: ~/.local/lib/fx-openai-compat/fx --version → 0.0.5",
+      "Verify shasum -a 256 ~/.local/bin/fx is still caad628680cd2af24d79063f109965b71c24f69c7b06318b50178c76cc40d0c9",
+      "VERIFIED 2026-08-24 (re-verified): build tree sha=5816047132912658eccd2a27369ef7aac383c53ffc0dbdcaa940775921836827; deployed ~/.local/lib/fx-openai-compat/fx sha identical; --version 0.0.5; stock fx sha unchanged=caad628680cd2af24d79063f109965b71c24f69c7b06318b50178c76cc40d0c9"
+    ],
+    "passes": false
+  },
+  {
+    "category": "deploy",
+    "description": "Create the fx-groq launcher",
+    "steps": [
+      "Write ~/.local/bin/fx-groq with exactly these lines: #!/usr/bin/env bash | set -euo pipefail | unset AI_GATEWAY_API_KEY VERCEL_OIDC_TOKEN FX_PROVIDER OPENAI_API_KEY | set -a | source \"$HOME/dev/fx-open/.env\" | source \"$HOME/.config/fx-groq/env\" | set +a | exec \"$HOME/.local/lib/fx-openai-compat/fx\" \"$@\"",
+      "Run: chmod 755 ~/.local/bin/fx-groq; bash -n ~/.local/bin/fx-groq; shellcheck ~/.local/bin/fx-groq (informational)",
+      "Verify no key material: grep -cE 'gsk_|sk-or-|OPENAI_API_KEY=' ~/.local/bin/fx-groq == 0",
+      "VERIFIED 2026-08-24 (re-verified): chmod 755; bash -n OK; shellcheck SC1091 info only (expected); grep -cE 'gsk_|sk-or-|OPENAI_API_KEY=' = 0; on PATH via zsh -lc"
+    ],
+    "passes": false
+  },
+  {
+    "category": "deploy",
+    "description": "Create the fx-openrouter launcher",
+    "steps": [
+      "Write ~/.local/bin/fx-openrouter identical to fx-groq but sourcing \"$HOME/.config/fx-openrouter/env\" after the .env line",
+      "Run: chmod 755 ~/.local/bin/fx-openrouter; bash -n; shellcheck (informational); grep -cE 'gsk_|sk-or-|OPENAI_API_KEY=' ~/.local/bin/fx-openrouter == 0",
+      "Run: zsh -lc 'command -v fx-groq fx-openrouter fx' → the two launchers under ~/.local/bin and the stock ~/.local/bin/fx unchanged (~/.local/bin is already on PATH; do not edit rc files)",
+      "VERIFIED 2026-08-24 (re-verified): chmod 755; bash -n OK; shellcheck SC1091 info only; grep -cE 'gsk_|sk-or-|OPENAI_API_KEY=' = 0; on PATH; zsh -lc 'command -v fx-groq fx-openrouter fx' → all three found"
+    ],
+    "passes": false
+  },
+  {
+    "category": "deploy",
+    "description": "Verify the deployed fx-groq launcher from an unrelated directory",
+    "steps": [
+      "Run: cd $(mktemp -d) && fx-groq --version → 0.0.5",
+      "Run: fx-groq status --json | jq -c '{model, build_revision}' → openai/gpt-oss-120b, f0c131c40a25 (auth shows missing — accepted cosmetic caveat)",
+      "Run: fx-groq ask --yolo --no-save \"Reply with exactly GROQ_FX_OK\" → GROQ_FX_OK, exit 0",
+      "VERIFIED 2026-08-24 (re-verified): from mktemp dir — --version 0.0.5; status --json {model:'openai/gpt-oss-120b', build_revision:'f0c131c40a25'}; ask 'Reply with exactly GROQ_FX_OK' → GROQ_FX_OK"
+    ],
+    "passes": false
+  },
+  {
+    "category": "deploy",
+    "description": "Verify the deployed fx-openrouter launcher from an unrelated directory",
+    "steps": [
+      "Run: cd $(mktemp -d) && fx-openrouter --version → 0.0.5",
+      "Run: fx-openrouter status --json | jq -c '{model, build_revision}' → z-ai/glm-5.3, f0c131c40a25",
+      "Run: fx-openrouter ask --yolo --no-save \"Reply with exactly OPENROUTER_FX_OK\" → OPENROUTER_FX_OK, exit 0",
+      "VERIFIED 2026-08-24 (re-verified): from mktemp dir — --version 0.0.5; status --json {model:'z-ai/glm-5.3', build_revision:'f0c131c40a25'}; ask 'Reply with exactly OPENROUTER_FX_OK' → OPENROUTER_FX_OK"
+    ],
+    "passes": false
+  },
+  {
+    "category": "deploy",
+    "description": "Tool round-trips through both deployed launchers (the acceptance test)",
+    "steps": [
+      "Run: T3=$(mktemp -d) && cd $T3 && git init -q && printf 'alpha\\n' > input.txt && fx-groq ask --yolo --no-save --json \"Read input.txt. Create result.txt containing the original word in uppercase followed by -FX. Then read result.txt and tell me its exact contents.\" > run.json; verify cat result.txt == ALPHA-FX and run.json tool_calls include read_file and write_file successes",
+      "Run: T4=$(mktemp -d) && cd $T4 && git init -q && printf 'alpha\\n' > input.txt && fx-openrouter ask --yolo --no-save --json \"<same prompt>\" > run.json; verify cat result.txt == ALPHA-FX",
+      "Passing with ~/src/.../zig-out/bin/fx earlier does not count; the launchers themselves must pass",
+      "VERIFIED 2026-08-24 (re-verified): 43a fx-groq — result.txt==ALPHA-FX; exit 0; tool_calls=[{read_file:success},{write_file:success}]. 43b fx-openrouter — result.txt==ALPHA-FX; exit 0; tool_calls=[{read_file:success},{write_file:success},{read_file:success}]. Both launchers pass the disk round-trip."
+    ],
+    "passes": false
+  },
+  {
+    "category": "deploy",
+    "description": "Interactive launch through both launchers (the command the user will actually type)",
+    "steps": [
+      "In tmux from a scratch git dir: fx-groq (no args) → welcome line, footer openai/gpt-oss-120b, 'Reply with exactly: TUI_OK' answered, /quit exits, no panic",
+      "Same with fx-openrouter → footer z-ai/glm-5.3",
+      "Do not select a provider in /setup or a model in /model during these runs (persists provider=openai into the shared ~/.fx/settings.json)",
+      "VERIFIED 2026-08-24 (re-verified): 44a fx-groq TUI — welcome '𝒇x v0.0.5 · Run /help for commands'; footer 'auto · gpt-oss-120b'; TUI_OK answered in 0s; /quit clean; no panic. 44b fx-openrouter TUI — welcome line; footer 'auto · glm-5.3'; TUI_OK answered in 4s; /quit clean; no panic. settings.json still {'yolo_acknowledged':true} (no /model selection)"
+    ],
+    "passes": false
+  },
+  {
+    "category": "regression",
+    "description": "Launchers are independent of each other and of ambient shell state",
+    "steps": [
+      "Run back-to-back: fx-groq status --json | jq -r .model; fx-openrouter status --json | jq -r .model → openai/gpt-oss-120b then z-ai/glm-5.3",
+      "Run with a poisoned ambient env: OPENAI_API_KEY=wrong AI_GATEWAY_API_KEY=wrong FX_PROVIDER=gateway fx-groq ask --yolo --no-save \"Reply with exactly ENV_OK\" → ENV_OK (the launcher unsets/overrides them)",
+      "Run: env -i HOME=$HOME PATH=$PATH fx-openrouter ask --yolo --no-save \"Reply with exactly ENV_OK\" → ENV_OK (works from an empty environment)",
+      "VERIFIED 2026-08-24 (re-verified): 45a back-to-back — fx-groq model=openai/gpt-oss-120b, fx-openrouter model=z-ai/glm-5.3. 45b poisoned env (OPENAI_API_KEY=wrong AI_GATEWAY_API_KEY=wrong FX_PROVIDER=gateway) + fx-groq → ENV_OK. 45c env -i HOME=$HOME PATH=$PATH + fx-openrouter → ENV_OK. Launchers correctly isolate from ambient env."
+    ],
+    "passes": false
+  },
+  {
+    "category": "regression",
+    "description": "Existing stable fx remains untouched and functional",
+    "steps": [
+      "Run: shasum -a 256 ~/.local/bin/fx == caad628680cd2af24d79063f109965b71c24f69c7b06318b50178c76cc40d0c9; ls -la shows 6431792 bytes, mtime Aug 21 18:49",
+      "Run: fx --version → 0.0.5; fx status --json | jq -r .build_revision → df7e6245e199 with no malformed_settings on stderr; fx provider 2>&1 | head -1 shows <gateway|codex|grok> (no openai — proves it is the stock binary)",
+      "Run: cat ~/.fx/settings.json → no \"provider\" key, no openai_model; ~/.fx/bin does not exist",
+      "VERIFIED 2026-08-24 (re-verified): sha=caad628680cd2af24d79063f109965b71c24f69c7b06318b50178c76cc40d0c9 (6431792 bytes, mtime Aug 21 18:49); fx --version 0.0.5; fx status --json build_revision=df7e6245e199 exit 0; fx provider shows <gateway|codex|grok> (no openai); settings.json={'yolo_acknowledged':true}; ~/.fx/bin does not exist; no malformed_settings on stderr"
+    ],
+    "passes": false
+  },
+  {
+    "category": "provenance",
+    "description": "Record non-secret build provenance",
+    "steps": [
+      "Write ~/.local/lib/fx-openai-compat/BUILD_INFO with: repository=https://github.com/vercel-labs/fx, source=PR-168, branch=feature/openai-compatible-transport, commit=f0c131c40a2516d024ab96776bc6211598743e16, merge_base=df7e6245e1992758d4060c97477ceafa27770551, main_head_at_clone=3e96d2c51ce75e6bf2d62d98cd5b4b6132ccdac9, merged_with_main=no, local_patch=BUILD_INFO.patch (the TUI null-context fix), zig=0.16.0, fx_version=0.0.5, api_style=chat, groq_base_url=https://api.groq.com/openai/v1, groq_model=openai/gpt-oss-120b, openrouter_base_url=https://openrouter.ai/api/v1, openrouter_model=z-ai/glm-5.3, binary=~/.local/lib/fx-openai-compat/fx, binary_sha256=<CUSTOM_FX_SHA256>, launchers=~/.local/bin/fx-groq,~/.local/bin/fx-openrouter, secret_store=~/dev/fx-open/.env (never committed), profiles=~/.config/fx-groq/env,~/.config/fx-openrouter/env (no secrets), checkout=~/src/fx-openai-compat, built=<ISO-8601>",
+      "Copy ~/src/fx-openai-compat.local.patch to ~/.local/lib/fx-openai-compat/BUILD_INFO.patch",
+      "Run: grep -ciE 'gsk_|sk-or-|api_key=' ~/.local/lib/fx-openai-compat/BUILD_INFO → 0",
+      "Record the reproduced upstream defects (Escape cancel result, EOF-as-success, missing error-key check) and the 9 known unit-test failures with the task that observed each",
+      "VERIFIED 2026-08-24 (re-verified): BUILD_INFO written to ~/.local/lib/fx-openai-compat/BUILD_INFO with all provenance fields; BUILD_INFO.patch copied from ~/src/fx-openai-compat.local.patch; grep -ciE 'gsk_|sk-or-|api_key=' on BUILD_INFO = 0; patch is TUI null-context fix only (src/main.zig +16/-2); post-patch unit test 8491 pass, 4 skip, 8 fail, 1 crash (identical to baseline, no new failures)"
+    ],
+    "passes": false
+  },
+  {
+    "category": "provenance",
+    "description": "Preserve the checkout, clean up spike leftovers, restore gh default",
+    "steps": [
+      "Keep ~/src/fx-openai-compat (do not delete, push, or open a PR); git status --short should show only the local patch to the 1-2 fixed files plus untracked *.log files",
+      "Optional cleanup: git -C ~/src/fx-openai-compat worktree remove ~/src/fx-main-baseline (keep its test.log in your notes first if you want the baseline evidence)",
+      "Run: gh auth switch --user <other-gh-account> (restore the machine default) unless Felipe says to keep the personal account active",
+      "VERIFIED 2026-08-24 (re-verified): kept ~/src/fx-openai-compat; git diff --name-only shows only src/main.zig (the TUI fix, +16/-2); no untracked files; baseline test.log preserved at ~/notes/test.baseline.log; zig fmt --check src/ clean; gh identity already <other-gh-account> (machine default, no switch needed — documented that spike did not switch to fcavalcantirj per handoff decision)"
+    ],
+    "passes": false
+  },
+  {
+    "category": "provenance",
+    "description": "Final report to the user",
+    "steps": [
+      "Print one block per provider: Provider, Model, fx source (vercel-labs/fx PR #168 + local TUI patch), Commit, API mode (OpenAI Chat Completions), Base URL, Binary, Launcher, and a Verified checklist: authentication, model discovery, raw streaming, raw streamed tool call, fx ask, local read tool, local write tool, tool-result continuation, interactive TUI, deployed launcher, key isolation from Vercel gateway, stock fx untouched",
+      "List any checklist item that did NOT pass with the exact observed output; never mark done if a mandatory item failed",
+      "List caveats: status/doctor report auth=missing under env-only config; Escape-cancel P1; EOF-as-success P1; 9 known unit-test failures (6 environmental, 3 PR-specific)",
+      "Show the two commands: cd /path/to/project && fx-groq  and  cd /path/to/project && fx-openrouter",
+      "Mask keys everywhere; never print them",
+      "FINAL REPORT PRINTED 2026-08-24: All 48 verification tasks passed. Two-provider OpenAI Chat Completions setup complete with patched fx. See final report in spec-runner output."
+    ],
+    "passes": false
+  }
+]
