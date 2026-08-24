@@ -1,0 +1,43 @@
+diff --git a/src/main.zig b/src/main.zig
+index 60fcbbb..9145087 100644
+--- a/src/main.zig
++++ b/src/main.zig
+@@ -456,6 +456,20 @@ const App = struct {
+         };
+     }
+ 
++    /// Returns the model-catalog provider for the currently selected provider.
++    /// For `.openai` this attaches the OpenAI-compatible config context (held on
++    /// the App so it outlives the async catalog preload); for every other
++    /// provider it returns the static builtin catalog as before. This is the
++    /// same provider construction the synchronous CLI path uses, applied here so
++    /// the interactive TUI catalog preload no longer receives a null context.
++    fn catalogProviderForSelected(self: *App) model_catalog.Provider {
++        const provider = self.provider_selection.selection().provider;
++        return if (provider == .openai)
++            self.openAiModelCatalogProvider()
++        else
++            builtin_providers.modelCatalog(provider);
++    }
++
+     pub fn fetchProviderCatalog(
+         self: *Self,
+         provider: model_provider.ProviderId,
+@@ -1786,7 +1800,7 @@ const App = struct {
+             if (comptime host_target.is_wasm)
+                 js_host_model_catalog.provider
+             else
+-                builtin_providers.modelCatalog(self.provider_selection.selection().provider),
++                self.catalogProviderForSelected(),
+             builtin_gateway.models_path,
+         );
+     }
+@@ -1803,7 +1817,7 @@ const App = struct {
+             );
+         } else {
+             self.model_cache.startWarmup(
+-                builtin_providers.modelCatalog(self.provider_selection.selection().provider),
++                self.catalogProviderForSelected(),
+                 self.auth.modelCatalogAccess(),
+             );
+         }

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset AI_GATEWAY_API_KEY VERCEL_OIDC_TOKEN FX_PROVIDER OPENAI_API_KEY
+set -a
+source "$HOME/dev/fx-open/.env"
+source "$HOME/.config/fx-groq/env"
+set +a
+exec "$HOME/.local/lib/fx-openai-compat/fx" "$@"

@@ -1,0 +1,38 @@
+repository=https://github.com/vercel-labs/fx
+source=PR-168
+branch=feature/openai-compatible-transport
+commit=f0c131c40a2516d024ab96776bc6211598743e16
+merge_base=df7e6245e1992758d4060c97477ceafa27770551
+main_head_at_clone=3e96d2c51ce75e6bf2d62d98cd5b4b6132ccdac9
+merged_with_main=no
+local_patch=BUILD_INFO.patch (the TUI null-context fix)
+zig=0.16.0
+fx_version=0.0.5
+api_style=chat
+groq_base_url=https://api.groq.com/openai/v1
+groq_model=openai/gpt-oss-120b
+openrouter_base_url=https://openrouter.ai/api/v1
+openrouter_model=z-ai/glm-5.3
+binary=~/.local/lib/fx-openai-compat/fx
+binary_sha256=5816047132912658eccd2a27369ef7aac383c53ffc0dbdcaa940775921836827
+launchers=~/.local/bin/fx-groq,~/.local/bin/fx-openrouter
+secret_store=~/dev/fx-open/.env (never committed)
+profiles=~/.config/fx-groq/env,~/.config/fx-openrouter/env (no secrets)
+checkout=~/src/fx-openai-compat
+built=2026-08-24T20:38:15Z
+
+# Observed upstream defects (not patched; reported for transparency)
+defect.escape_cancel=TUI-level Escape shows '● System: cancelled'; known P1: chat SSE handler has no API-level cancellation watcher, so the HTTP stream may continue in background
+defect.eof_as_success=P1: a bare SSE EOF with no finish_reason is committed as a successful turn (upstream, unfixed)
+defect.missing_error_key_check=P1: chat SSE handler does not inspect a top-level 'error' key in data events (OpenRouter mid-stream errors); HTTP-level errors ARE handled
+known_unit_test_failures_6_env=core.agent.runtime.assistant_stream.test.streamed_presentation_preserves_ANSI_OSC_8_code_fence_and_table_spans; core.tooling.tool_runtime.test.run_command_success_exposes_structured_foreground_metadata; core.tooling.tool_runtime.test.run_command_returns_model_output_and_structured_metadata; core.tooling.tool_runtime.test.run_command_nonzero_exit_returns_structured_masked_failure; core.tooling.tool_runtime.test.run_command_huge_output_exposes_truncation_and_artifact_paths_without_stdout_body; core.execution.command_runner.test.explicit_captured_profiles_execute_exact_shells_without_synthetic_stderr
+known_unit_test_failures_3_pr=core.app.app_lifecycle.test.FX_PROVIDER_overrides_saved_provider_selection; ui.footer.picker_presentation.test.partially_visible_auth_picker_shows_a_source_window_without_duplicates; core.session.session_resume_view.test.resume_view_sidecar_classifies_exact_and_older_durable_boundaries (crash: incorrect alignment)
+post_patch_unit_test_result=8491 pass, 4 skip, 8 fail, 1 crash (8504 total) — identical to baseline, no new failures
+
+# Independent validation 2026-08-24 (second session)
+validation.groq=launcher fx-groq re-verified: GROQ_FX_OK, ALPHA-FX round-trip, 0 requests to a loopback gateway, TUI welcome/footer/TUI_OK, poisoned-env ENV_OK
+validation.openrouter=launcher fx-openrouter returned OPENROUTER_FX_OK once, then every request (fx and raw curl) failed with HTTP 402 credits: 'You requested up to 65536 tokens, but can only afford 64942'. Raw curl with max_tokens 512 succeeds. Remedy: add OpenRouter credits (fx reserves 65536 output tokens per request)
+validation.unit_tests=8491 pass / 4 skip / 8 fail / 1 crash (same 9 names); e2e fake tests 5/5; deployed sha == rebuilt sha
+validation.spec_scrub=task 21 evidence had the first 8 chars of the Groq key and 13 chars of the OpenRouter key; replaced with <redacted> in fx-openai-compat-spec.json and ~/notes/spec.backup.json
+validation.sessions=11 sessions written by the PR build (15:32-17:45, 9 with "provider":"openai") were unreadable by stock fx 0.0.5 (InvalidSessionFormat, doctor '[fail] session ... projection_invalid'); moved to ~/.local/lib/fx-openai-compat/sessions-relocated/ (ids in relocated-ids.txt, previous index in index.json.before) and pruned from ~/.fx/sessions/index.json. Interactive runs of the custom build will keep creating such sessions in the shared ~/.fx/sessions; stock fx cannot read them
+validation.baseline_worktree=~/src/fx-main-baseline removed; its unit-test log kept as baseline-main-3e96d2c.test.log beside this file
