@@ -62,8 +62,7 @@ paths="$(git diff --name-only "$fork_base" main)"
 [ -n "$paths" ] || { echo "nothing fork-specific on main to carry over" >&2; exit 1; }
 wt="$(mktemp -d)/main"
 echo; echo "re-creating main = $latest + fork files ($(printf '%s\n' "$paths" | wc -l | tr -d ' ') paths) in a temporary worktree ..."
-git worktree add -q --detach "$wt" "$tag_sha"
-git -C "$wt" checkout -q -B main "$tag_sha"
+git worktree add -q --detach "$wt" "$tag_sha"   # detached: works even when main is checked out elsewhere
 printf '%s\n' "$paths" | while IFS= read -r f; do
   if git cat-file -e "$old_main:$f" 2>/dev/null; then git -C "$wt" checkout -q "$old_main" -- "$f"; git -C "$wt" add -f -- "$f"; else git -C "$wt" rm -q --ignore-unmatch -- "$f"; fi
 done
@@ -71,8 +70,13 @@ git -C "$wt" commit -q -m "fx-open: docs and tooling on $latest
 
 Carried over from $(git rev-parse --short "$old_main") (fork commits squashed onto the upstream release tag)." \
   || { git worktree remove --force "$wt"; git worktree prune; echo "nothing to commit" >&2; exit 1; }
-git -C "$wt" push --force-with-lease=main:"$old_main" origin main
+git -C "$wt" push --force-with-lease=main:"$old_main" origin HEAD:refs/heads/main
 git -C "$wt" push -q origin "refs/tags/$latest"
 git worktree remove --force "$wt"; git worktree prune
-git fetch -q origin && git branch -f main origin/main
-echo "done: main = $latest + 1 fork commit -> $(git rev-parse --short main); tag $latest pushed to origin"
+git fetch -q origin
+if [ "$(git branch --show-current)" = main ]; then
+  if [ -z "$(git status --porcelain --untracked-files=no)" ]; then git reset -q --hard origin/main; else echo "note: local main left untouched (uncommitted changes); run: git reset --hard origin/main" >&2; fi
+else
+  git branch -f main origin/main
+fi
+echo "done: origin/main = $latest + 1 fork commit -> $(git rev-parse --short origin/main); tag $latest pushed to origin"
